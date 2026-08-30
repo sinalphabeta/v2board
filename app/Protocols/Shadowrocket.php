@@ -22,11 +22,53 @@ class Shadowrocket
 
         $uri = '';
         //display remaining traffic and expire date
-        $upload = round($user['u'] / (1024*1024*1024), 2);
-        $download = round($user['d'] / (1024*1024*1024), 2);
+        // $upload = round($user['u'] / (1024*1024*1024), 2);
+        // $download = round($user['d'] / (1024*1024*1024), 2);
+        // $usedTraffic = round(($user['u'] + $user['d']) / (1024*1024*1024), 2);
+        // $totalTraffic = round($user['transfer_enable'] / (1024*1024*1024), 2);
+        // $expiredDate = date('Y-m-d', $user['expired_at']);
+        // $uri .= "STATUS=🚀流量:{$usedTraffic}GB/{$totalTraffic}GB💡到期:{$expiredDate},点↻刷新→\r\n";
+
+        
+        // --- 1. 流量计算与表情判断 ---
+        // 计算数值 (GB) 用于显示
+        $usedTraffic = round(($user['u'] + $user['d']) / (1024*1024*1024), 2);
         $totalTraffic = round($user['transfer_enable'] / (1024*1024*1024), 2);
-        $expiredDate = date('Y-m-d', $user['expired_at']);
-        $uri .= "STATUS=🚀↑:{$upload}GB,↓:{$download}GB,TOT:{$totalTraffic}GB💡Expires:{$expiredDate}\r\n";
+        
+        // 计算百分比
+        $percentage = 0;
+        if ($user['transfer_enable'] > 0) {
+            $percentage = (($user['u'] + $user['d']) / $user['transfer_enable']) * 100;
+        }
+
+        // 根据百分比设定流量表情
+        $trafficEmoji = '🥳'; // 默认 (<=80%)
+        if ($percentage > 95) {
+            $trafficEmoji = '😣'; // >95%
+        } elseif ($percentage > 80) {
+            $trafficEmoji = '😢'; // 80% - 95%
+        }
+
+        // --- 2. 到期时间判断 ---
+        $expireEmoji = '💡'; // 默认表情
+        $expiredDateStr = '';
+
+        if (is_null($user['expired_at'])) {
+            // 如果是 NULL，显示长期有效
+            $expiredDateStr = '长期有效';
+        } else {
+            // 格式化日期
+            $expiredDateStr = date('Y-m-d', $user['expired_at']);
+            
+            // 检查是否剩余少于 48 小时 (48 * 3600 = 172800 秒)
+            // 且必须是尚未过期的情况 ( > time() )
+            if (($user['expired_at'] - time()) < 172800 && ($user['expired_at'] > time())) {
+                $expireEmoji = '‼️';
+            }
+        }
+
+        // --- 3. 拼接最终字符串 ---
+        $uri .= "STATUS={$trafficEmoji}流量:{$usedTraffic}GB/{$totalTraffic}GB{$expireEmoji}到期:{$expiredDateStr},点↻刷新→\r\n";
 
         foreach ($this->servers as $server) {
             if ($server['type'] === 'vmess' || ($server['type'] === 'v2node' && $server['protocol'] === 'vmess')) {
