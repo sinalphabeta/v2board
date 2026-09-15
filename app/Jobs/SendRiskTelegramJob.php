@@ -38,7 +38,7 @@ class SendRiskTelegramJob implements ShouldQueue
             $ipLine = "\nip: " . $this->markdownCode($this->ip);
             $position = strpos($text, $ipLine);
             if ($position !== false) {
-                $infoLine = "\nip_info: " . $this->markdownCode($ipInfoService->describe($this->ip));
+                $infoLine = "\nip\\_info: " . $this->markdownCode($ipInfoService->describe($this->ip));
                 $text = substr_replace($text, $ipLine . $infoLine, $position, strlen($ipLine));
             }
         }
