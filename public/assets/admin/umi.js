@@ -5652,6 +5652,7 @@
                 e.email)
                   , y = e.telegram
                   , b = e.setTelegramWebhookLoading
+                  , R = e.setRiskTelegramWebhookLoading
                   , w = e.app
                   , x = e.testSendMailLoading
                   , _ = e.safe
@@ -6418,6 +6419,18 @@
                     loading: b,
                     disabled: b
                 }, "\u4e00\u952e\u8bbe\u7f6e")), f.a.createElement(m, {
+                    title: "\u98ce\u9669 Bot Webhook",
+                    description: "\u4e3a\u72ec\u7acb\u98ce\u9669 Bot \u8bbe\u7f6e Webhook\u3002"
+                }, f.a.createElement(o["a"], {
+                    type: "primary",
+                    onClick: ()=>{
+                        this.props.dispatch({
+                            type: "config/setRiskTelegramWebhook"
+                        })
+                    },
+                    loading: R,
+                    disabled: R
+                }, "\u8bbe\u7f6e\u98ce\u9669 Webhook")), f.a.createElement(m, {
                     title: "\u5f00\u542f\u673a\u5668\u4eba\u901a\u77e5",
                     description: "\u5f00\u542f\u540ebot\u5c06\u4f1a\u5bf9\u7ed1\u5b9a\u4e86telegram\u7684\u7ba1\u7406\u5458\u548c\u7528\u6237\u8fdb\u884c\u57fa\u7840\u901a\u77e5\u3002"
                 }, f.a.createElement(l["a"], {
@@ -16793,13 +16806,15 @@
             server: {},
             email: {},
             telegram: {},
+            risk: {},
             app: {},
             safe: {},
             tabs: "site",
             fetchLoading: !1,
             emailTemplate: [],
             themeTemplate: [],
-            setTelegramWebhookLoading: !1
+            setTelegramWebhookLoading: !1,
+            setRiskTelegramWebhookLoading: !1
         };
         t["default"] = {
             name: "config",
@@ -17002,6 +17017,48 @@
                                     return e.abrupt("return");
                                 case 9:
                                     i["a"].success("webhook \u8bbe\u7f6e\u6210\u529f");
+                                case 10:
+                                case "end":
+                                    return e.stop()
+                                }
+                        }, e)
+                    })()
+                },
+                setRiskTelegramWebhook(e, t) {
+                    var r = t.put;
+                    return u().mark(function e() {
+                        var t;
+                        return u().wrap(function(e) {
+                            while (1)
+                                switch (e.prev = e.next) {
+                                case 0:
+                                    return e.next = 2,
+                                    r({
+                                        type: "setState",
+                                        payload: {
+                                            setRiskTelegramWebhookLoading: !0
+                                        }
+                                    });
+                                case 2:
+                                    return e.next = 4,
+                                    Object(c["b"])("/" + window.settings.secure_path + "/config/setRiskTelegramWebhook", {});
+                                case 4:
+                                    return t = e.sent,
+                                    e.next = 7,
+                                    r({
+                                        type: "setState",
+                                        payload: {
+                                            setRiskTelegramWebhookLoading: !1
+                                        }
+                                    });
+                                case 7:
+                                    if (200 === t.code) {
+                                        e.next = 9;
+                                        break
+                                    }
+                                    return e.abrupt("return");
+                                case 9:
+                                    i["a"].success("\u98ce\u9669 Webhook \u8bbe\u7f6e\u6210\u529f");
                                 case 10:
                                 case "end":
                                     return e.stop()
