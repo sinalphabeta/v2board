@@ -67,11 +67,12 @@ abstract class RiskCommand extends Telegram
     {
         $used = ((int)$user->u + (int)$user->d) / 1073741824;
         $total = (int)$user->transfer_enable / 1073741824;
+        $traffic = $this->escapeMarkdown(number_format($used, 2) . ' / ' . number_format($total, 2) . ' GB');
         $expired = $user->expired_at === null ? '长期有效' : date('Y-m-d H:i:s', (int)$user->expired_at);
         $registered = $user->created_at ? date('Y-m-d H:i:s', (int)$user->created_at) : '-';
         return "邮箱: " . $this->markdownCode($user->email) . "\nuid: " . $this->markdownCode((int)$user->id) . "\n注册时间: " .
             $this->escapeMarkdown($registered) . "\n套餐: " . $this->escapeMarkdown($plan ? $plan->name : '无订阅') .
-            "\n流量: " . number_format($used, 2) . ' / ' . number_format($total, 2) . " GB\n到期时间: " .
+            "\n流量: " . $traffic . "\n到期时间: " .
             $this->escapeMarkdown($expired) . "\n权限组: " . $this->escapeMarkdown($user->group_id ?? '-');
     }
 
@@ -161,6 +162,11 @@ abstract class RiskCommand extends Telegram
         return implode("\n", array_map(function ($value) {
             return '• ' . $this->markdownCode($value);
         }, $values));
+    }
+
+    protected function numberedItem(int $number, string $content): string
+    {
+        return $number . '\\. ' . $content;
     }
 
     protected function markdownCode($value): string

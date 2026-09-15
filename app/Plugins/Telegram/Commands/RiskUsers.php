@@ -37,8 +37,8 @@ class RiskUsers extends RiskCommand
         $plans = Plan::whereIn('id', $users->pluck('plan_id')->filter()->all())->get()->keyBy('id');
         $text = "📋 *内鬼用户*\n共 {$total} 个\n第 {$page}/{$pages} 页";
         foreach ($users as $index => $user) {
-            $text .= "\n\n" . (($page - 1) * self::PAGE_SIZE + $index + 1) . ". " .
-                $this->userSummary($user, $plans->get($user->plan_id));
+            $number = ($page - 1) * self::PAGE_SIZE + $index + 1;
+            $text .= "\n\n" . $this->numberedItem($number, $this->userSummary($user, $plans->get($user->plan_id)));
         }
         if (!$users->count()) $text .= "\n\nempty";
         $buttons = [];
