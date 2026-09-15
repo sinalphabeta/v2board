@@ -186,7 +186,7 @@ class RiskService
             "\nrules: " . $code($rules);
         $token = (string)config('risk.bot_token', '');
         if (!$token) return;
-        try { SendRiskTelegramJob::dispatch((int)$chatId, $text); } catch (\Throwable $e) { /* queue unavailable */ }
+        try { SendRiskTelegramJob::dispatch((int)$chatId, $text, $ip); } catch (\Throwable $e) { /* queue unavailable */ }
     }
 
     public function addIndicator(string $type, string $value, ?string $note = null, ?int $actorId = null): RiskIndicator

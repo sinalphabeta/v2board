@@ -28,6 +28,7 @@ if [ $php_main_version -ge 8 ]; then
 fi
 
 php artisan v2board:update
+php artisan risk:geoip-update || echo "Warning: GeoIP database update failed; keeping the existing database."
 
 if [ -f "/etc/init.d/bt" ]; then
   chown -R www $(pwd);
