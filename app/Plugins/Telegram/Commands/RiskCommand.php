@@ -22,12 +22,12 @@ abstract class RiskCommand extends Telegram
     {
         $alertChatId = (string)config('risk.alert_chat_id', '');
         if (empty($message->is_private) && (!$alertChatId || (string)$message->chat_id !== $alertChatId)) {
-            $this->telegramService->sendMessage($message->chat_id, '请私聊风险 Bot 执行此命令');
+            $this->sendReply($message, '请私聊风险 Bot 执行此命令');
             return false;
         }
         $telegramId = $message->sender_id ?? $message->chat_id;
         $user = User::where('telegram_id', $telegramId)->where('is_admin', 1)->first();
-        if (!$user) { $this->telegramService->sendMessage($message->chat_id, '无权限'); return false; }
+        if (!$user) { $this->sendReply($message, '无权限'); return false; }
         $this->actorId = $user->id;
         return true;
     }
@@ -35,7 +35,7 @@ abstract class RiskCommand extends Telegram
     protected function add($message, string $type): void
     {
         if (!$this->authorized($message)) return;
-        if (empty($message->args[0])) { $this->sendMarkdown($message->chat_id, '用法: `' . $this->command . ' value`'); return; }
+        if (empty($message->args[0])) { $this->sendMarkdownReply($message, '用法: `' . $this->command . ' value`'); return; }
 
         $service = new RiskService();
         $values = $type === 'ua' ? [implode(' ', $message->args)] : $message->args;
@@ -60,7 +60,7 @@ abstract class RiskCommand extends Telegram
         if ($added) $text .= "\n\n✅ 新增 " . count($added) . " 条:\n" . $this->bulletList($added);
         if ($existing) $text .= "\n\n⚠️ 已存在 " . count($existing) . " 条:\n" . $this->bulletList($existing);
         if ($invalid) $text .= "\n\n❌ 格式无效 " . count($invalid) . " 条:\n" . $this->bulletList($invalid);
-        $this->sendMarkdown($message->chat_id, $text);
+        $this->sendMarkdownReply($message, $text);
     }
 
     protected function userSummary(User $user, ?Plan $plan = null): string
@@ -78,7 +78,7 @@ abstract class RiskCommand extends Telegram
     protected function delete($message, string $type): void
     {
         if (!$this->authorized($message)) return;
-        if (empty($message->args[0])) { $this->sendMarkdown($message->chat_id, '用法: `' . $this->command . ' value`'); return; }
+        if (empty($message->args[0])) { $this->sendMarkdownReply($message, '用法: `' . $this->command . ' value`'); return; }
 
         $service = new RiskService();
         $values = $type === 'ua' ? [implode(' ', $message->args)] : $message->args;
@@ -96,7 +96,7 @@ abstract class RiskCommand extends Telegram
         $text = '*操作完成*';
         if ($deleted) $text .= "\n\n✅ 删除 " . count($deleted) . " 条:\n" . $this->bulletList($deleted);
         if ($missing) $text .= "\n\n⚠️ 不存在 " . count($missing) . " 条:\n" . $this->bulletList($missing);
-        $this->sendMarkdown($message->chat_id, $text);
+        $this->sendMarkdownReply($message, $text);
     }
 
     protected function eventLines(User $user, string $type): string
@@ -115,7 +115,7 @@ abstract class RiskCommand extends Telegram
         })->implode("\n");
     }
 
-    protected function sendIndicatorPage(string $type, string $title, string $callbackPrefix, int $page, int $chatId, int $messageId = 0): void
+    protected function sendIndicatorPage(string $type, string $title, string $callbackPrefix, int $page, int $chatId, int $messageId = 0, int $replyToMessageId = 0): void
     {
         $pageSize = $type === 'ua' ? 10 : 20;
         $query = RiskIndicator::where('type', $type)->where('enabled', 1)->orderBy('value', 'asc');
@@ -130,12 +130,23 @@ abstract class RiskCommand extends Telegram
         if ($page < $pages) $buttons[] = ['text' => '下一页 ➡️', 'callback_data' => $callbackPrefix . ':' . ($page + 1)];
         $markup = ['inline_keyboard' => $buttons ? [$buttons] : []];
         if ($messageId) $this->telegramService->editMessageText($chatId, $messageId, $text, 'MarkdownV2', $markup);
-        else $this->telegramService->sendMessage($chatId, $text, 'MarkdownV2', $markup);
+        else $this->telegramService->sendMessage($chatId, $text, 'MarkdownV2', $markup, $replyToMessageId ?: null);
     }
 
     protected function sendMarkdown(int $chatId, string $text, array $replyMarkup = []): void
     {
         $this->telegramService->sendMessage($chatId, $text, 'MarkdownV2', $replyMarkup);
+    }
+
+    protected function sendReply($message, string $text, string $parseMode = '', array $replyMarkup = []): void
+    {
+        $replyToMessageId = !empty($message->message_id) ? (int)$message->message_id : null;
+        $this->telegramService->sendMessage((int)$message->chat_id, $text, $parseMode, $replyMarkup, $replyToMessageId);
+    }
+
+    protected function sendMarkdownReply($message, string $text, array $replyMarkup = []): void
+    {
+        $this->sendReply($message, $text, 'MarkdownV2', $replyMarkup);
     }
 
     protected function escapeMarkdown($value): string

@@ -58,7 +58,7 @@ class RiskTelegramController extends Controller
                 $instance->handle($msg);
             } catch (\Throwable $e) {
                 report($e);
-                (new TelegramService($token))->sendMessage($msg->chat_id, '处理失败，请检查服务日志');
+                (new TelegramService($token))->sendMessage($msg->chat_id, '处理失败，请检查服务日志', '', [], (int)($msg->message_id ?? 0) ?: null);
             }
             return;
         }

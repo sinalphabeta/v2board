@@ -14,7 +14,7 @@ class TelegramService {
         $this->api = 'https://api.telegram.org/bot' . ($token ?: config('v2board.telegram_bot_token')) . '/';
     }
 
-    public function sendMessage(int $chatId, string $text, string $parseMode = '', array $replyMarkup = [])
+    public function sendMessage(int $chatId, string $text, string $parseMode = '', array $replyMarkup = [], ?int $replyToMessageId = null)
     {
         if ($parseMode === 'markdown') {
             $text = str_replace('_', '\_', $text);
@@ -25,6 +25,10 @@ class TelegramService {
             'parse_mode' => $parseMode
         ];
         if ($replyMarkup) $params['reply_markup'] = json_encode($replyMarkup, JSON_UNESCAPED_UNICODE);
+        if ($replyToMessageId) {
+            $params['reply_to_message_id'] = $replyToMessageId;
+            $params['allow_sending_without_reply'] = true;
+        }
         return $this->request('sendMessage', $params);
     }
 

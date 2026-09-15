@@ -14,7 +14,7 @@ class RiskUsers extends RiskCommand
     public function handle($message, $match = [])
     {
         if (!$this->authorized($message)) return;
-        $this->sendPage((int)($message->args[0] ?? 1), (int)$message->chat_id);
+        $this->sendPage((int)($message->args[0] ?? 1), (int)$message->chat_id, 0, (int)($message->message_id ?? 0));
     }
 
     public function handleCallback($message, string $callbackQueryId, int $page)
@@ -27,7 +27,7 @@ class RiskUsers extends RiskCommand
         $this->sendPage($page, (int)$message->chat_id, (int)$message->message_id);
     }
 
-    private function sendPage(int $page, int $chatId, int $messageId = 0): void
+    private function sendPage(int $page, int $chatId, int $messageId = 0, int $replyToMessageId = 0): void
     {
         $query = User::where('risk_status', 1)->orderBy('id', 'asc');
         $total = $query->count();
@@ -46,6 +46,6 @@ class RiskUsers extends RiskCommand
         if ($page < $pages) $buttons[] = ['text' => '下一页 ➡️', 'callback_data' => 'risk_users:' . ($page + 1)];
         $markup = ['inline_keyboard' => $buttons ? [$buttons] : []];
         if ($messageId) $this->telegramService->editMessageText($chatId, $messageId, $text, 'MarkdownV2', $markup);
-        else $this->telegramService->sendMessage($chatId, $text, 'MarkdownV2', $markup);
+        else $this->telegramService->sendMessage($chatId, $text, 'MarkdownV2', $markup, $replyToMessageId ?: null);
     }
 }
