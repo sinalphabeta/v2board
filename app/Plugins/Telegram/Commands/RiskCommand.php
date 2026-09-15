@@ -35,9 +35,32 @@ abstract class RiskCommand extends Telegram
     protected function add($message, string $type): void
     {
         if (!$this->authorized($message)) return;
-        if (empty($message->args[0])) { $this->telegramService->sendMessage($message->chat_id, '用法：' . $this->command . ' value'); return; }
-        (new RiskService())->addIndicator($type, implode(' ', $message->args), null, $this->actorId);
-        $this->telegramService->sendMessage($message->chat_id, '已添加');
+        if (empty($message->args[0])) { $this->sendMarkdown($message->chat_id, '用法: `' . $this->command . ' value`'); return; }
+
+        $service = new RiskService();
+        $values = $type === 'ua' ? [implode(' ', $message->args)] : $message->args;
+        $added = [];
+        $existing = [];
+        $invalid = [];
+        foreach ($values as $rawValue) {
+            $value = $type === 'email' ? $service->normalizeEmail($rawValue) : trim((string)$rawValue);
+            if (!$this->validIndicatorValue($type, $value)) {
+                $invalid[] = $value;
+                continue;
+            }
+            $indicator = RiskIndicator::where('type', $type)->where('value', $value)->first();
+            if ($indicator && (int)$indicator->enabled === 1) {
+                $existing[] = $value;
+                continue;
+            }
+            $service->addIndicator($type, $value, null, $this->actorId);
+            $added[] = $value;
+        }
+        $text = '*操作完成*';
+        if ($added) $text .= "\n\n✅ 新增 " . count($added) . " 条:\n" . $this->bulletList($added);
+        if ($existing) $text .= "\n\n⚠️ 已存在 " . count($existing) . " 条:\n" . $this->bulletList($existing);
+        if ($invalid) $text .= "\n\n❌ 格式无效 " . count($invalid) . " 条:\n" . $this->bulletList($invalid);
+        $this->sendMarkdown($message->chat_id, $text);
     }
 
     protected function userSummary(User $user, ?Plan $plan = null): string
@@ -46,9 +69,34 @@ abstract class RiskCommand extends Telegram
         $total = (int)$user->transfer_enable / 1073741824;
         $expired = $user->expired_at === null ? '长期有效' : date('Y-m-d H:i:s', (int)$user->expired_at);
         $registered = $user->created_at ? date('Y-m-d H:i:s', (int)$user->created_at) : '-';
-        return "邮箱：{$user->email}\n用户ID：{$user->id}\n注册时间：{$registered}\n套餐：" .
-            ($plan ? $plan->name : '无订阅') . "\n流量：" . number_format($used, 2) . '/' .
-            number_format($total, 2) . " GB\n到期时间：{$expired}\n权限组：" . ($user->group_id ?? '-');
+        return "邮箱: " . $this->markdownCode($user->email) . "\nuid: " . $this->markdownCode((int)$user->id) . "\n注册时间: " .
+            $this->escapeMarkdown($registered) . "\n套餐: " . $this->escapeMarkdown($plan ? $plan->name : '无订阅') .
+            "\n流量: " . number_format($used, 2) . ' / ' . number_format($total, 2) . " GB\n到期时间: " .
+            $this->escapeMarkdown($expired) . "\n权限组: " . $this->escapeMarkdown($user->group_id ?? '-');
+    }
+
+    protected function delete($message, string $type): void
+    {
+        if (!$this->authorized($message)) return;
+        if (empty($message->args[0])) { $this->sendMarkdown($message->chat_id, '用法: `' . $this->command . ' value`'); return; }
+
+        $service = new RiskService();
+        $values = $type === 'ua' ? [implode(' ', $message->args)] : $message->args;
+        $deleted = [];
+        $missing = [];
+        foreach ($values as $rawValue) {
+            $value = $type === 'email' ? $service->normalizeEmail($rawValue) : trim((string)$rawValue);
+            $indicator = RiskIndicator::where('type', $type)->where('value', $value)->where('enabled', 1)->first();
+            if (!$indicator) {
+                $missing[] = $value;
+                continue;
+            }
+            if ($service->removeIndicator($indicator, $this->actorId)) $deleted[] = $value;
+        }
+        $text = '*操作完成*';
+        if ($deleted) $text .= "\n\n✅ 删除 " . count($deleted) . " 条:\n" . $this->bulletList($deleted);
+        if ($missing) $text .= "\n\n⚠️ 不存在 " . count($missing) . " 条:\n" . $this->bulletList($missing);
+        $this->sendMarkdown($message->chat_id, $text);
     }
 
     protected function eventLines(User $user, string $type): string
@@ -62,7 +110,8 @@ abstract class RiskCommand extends Telegram
         return $events->map(function ($event) {
             $time = date('m-d H:i:s', (int)$event->last_seen_at);
             $ua = preg_replace('/\s+/', ' ', (string)$event->user_agent);
-            return "{$time} | {$event->ip} | " . substr($ua, 0, 96) . " | x{$event->occurrences}";
+            return $this->markdownCode($time) . ' \\| ' . $this->markdownCode($event->ip) . ' \\| ' .
+                $this->markdownCode(substr($ua, 0, 96)) . " \\| x" . (int)$event->occurrences;
         })->implode("\n");
     }
 
@@ -74,13 +123,49 @@ abstract class RiskCommand extends Telegram
         $pages = max(1, (int)ceil($total / $pageSize));
         $page = min(max(1, $page), $pages);
         $values = $query->forPage($page, $pageSize)->pluck('value');
-        $text = "📋 {$title} 共 {$total} 条 第 {$page}/{$pages} 页";
-        $text .= $values->count() ? "\n\n" . $values->implode("\n") : "\n\nempty";
+        $text = "📋 *" . $this->escapeMarkdown($title) . "*\n共 {$total} 条\n第 {$page}/{$pages} 页";
+        $text .= $values->count() ? "\n\n" . $this->bulletList($values->all()) : "\n\nempty";
         $buttons = [];
         if ($page > 1) $buttons[] = ['text' => '⬅️ 上一页', 'callback_data' => $callbackPrefix . ':' . ($page - 1)];
         if ($page < $pages) $buttons[] = ['text' => '下一页 ➡️', 'callback_data' => $callbackPrefix . ':' . ($page + 1)];
         $markup = ['inline_keyboard' => $buttons ? [$buttons] : []];
-        if ($messageId) $this->telegramService->editMessageText($chatId, $messageId, $text, '', $markup);
-        else $this->telegramService->sendMessage($chatId, $text, '', $markup);
+        if ($messageId) $this->telegramService->editMessageText($chatId, $messageId, $text, 'MarkdownV2', $markup);
+        else $this->telegramService->sendMessage($chatId, $text, 'MarkdownV2', $markup);
+    }
+
+    protected function sendMarkdown(int $chatId, string $text, array $replyMarkup = []): void
+    {
+        $this->telegramService->sendMessage($chatId, $text, 'MarkdownV2', $replyMarkup);
+    }
+
+    protected function escapeMarkdown($value): string
+    {
+        return preg_replace_callback('/[_*\[\]()~`>#+\-=|{}.!\\\\]/', function ($match) {
+            return '\\' . $match[0];
+        }, (string)$value);
+    }
+
+    protected function bulletList(array $values): string
+    {
+        return implode("\n", array_map(function ($value) {
+            return '• ' . $this->markdownCode($value);
+        }, $values));
+    }
+
+    protected function markdownCode($value): string
+    {
+        return '`' . str_replace(['\\', '`'], ['\\\\', '\\`'], (string)$value) . '`';
+    }
+
+    private function validIndicatorValue(string $type, string $value): bool
+    {
+        if ($value === '' || strlen($value) > 255) return false;
+        if ($type === 'email') return (bool)filter_var($value, FILTER_VALIDATE_EMAIL);
+        if ($type !== 'ip') return true;
+        [$address, $bits] = array_pad(explode('/', $value, 2), 2, null);
+        if (!filter_var($address, FILTER_VALIDATE_IP)) return false;
+        if ($bits === null) return true;
+        $max = filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? 128 : 32;
+        return ctype_digit($bits) && (int)$bits <= $max;
     }
 }

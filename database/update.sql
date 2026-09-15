@@ -906,3 +906,12 @@ CREATE TABLE IF NOT EXISTS `v2_risk_event` (
   KEY `risk_event_last_seen` (`last_seen_at`),
   KEY `risk_event_user_type_seen` (`user_id`,`event_type`,`last_seen_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+DELETE r1 FROM `v2_risk_indicator` r1
+INNER JOIN `v2_risk_indicator` r2
+  ON r1.`type` = r2.`type`
+ AND r1.`value` = r2.`value`
+ AND (r1.`enabled` < r2.`enabled` OR (r1.`enabled` = r2.`enabled` AND r1.`id` > r2.`id`));
+
+ALTER TABLE `v2_risk_indicator`
+ADD UNIQUE KEY `risk_indicator_type_value` (`type`,`value`);

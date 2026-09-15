@@ -172,9 +172,18 @@ class RiskService
         $rules = is_array($matches)
             ? implode(',', array_map(function ($m) { return $m->type . ':' . $m->value; }, $matches))
             : (string)$matches;
-        $text = "[Risk] {$eventType}\nuser_id=" . ($user ? $user->id : '-') .
-            "\nemail=" . ($user ? $user->email : '-') . "\nip={$ip}\nua={$ua}" .
-            "\nplan=" . ($plan ? $plan->name : '-') . "\ngroup=" . ($user ? $user->group_id : '-') . "\nrules={$rules}";
+        $escape = function ($value): string {
+            return preg_replace_callback('/[_*\[\]()~`>#+\-=|{}.!\\\\]/', function ($match) {
+                return '\\' . $match[0];
+            }, (string)$value);
+        };
+        $code = function ($value): string {
+            return '`' . str_replace(['\\', '`'], ['\\\\', '\\`'], (string)$value) . '`';
+        };
+        $text = "*\\[RISK\\]* _" . $escape($eventType) . "_\nuid: `" . ($user ? (int)$user->id : '-') . "`" .
+            "\nemail: " . $code($user ? $user->email : '-') . "\nip: " . $code($ip) . "\nua: " . $code($ua) .
+            "\nplan: " . $code($plan ? $plan->name : '-') . "\ngroup: " . $code($user ? $user->group_id : '-') .
+            "\nrules: " . $code($rules);
         $token = (string)config('risk.bot_token', '');
         if (!$token) return;
         try { SendRiskTelegramJob::dispatch((int)$chatId, $text); } catch (\Throwable $e) { /* queue unavailable */ }

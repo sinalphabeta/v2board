@@ -25,11 +25,11 @@ class Search extends RiskCommand
             return;
         }
         $plan = $user->plan_id ? Plan::find($user->plan_id) : null;
-        $text = "🔎 内鬼用户详情\n" . $this->userSummary($user, $plan) .
-            "\n\n最近 10 次拉取订阅（时间 | IP | UA | 次数）\n" .
+        $text = "🔎 *内鬼用户详情*\n" . $this->userSummary($user, $plan) .
+            "\n\n*最近 10 次拉取订阅*\n时间 \\| IP \\| UA \\| 次数\n" .
             $this->eventLines($user, 'subscription') .
-            "\n\n最近 10 次登录（时间 | IP | UA | 次数）\n" .
+            "\n\n*最近 10 次登录*\n时间 \\| IP \\| UA \\| 次数\n" .
             $this->eventLines($user, 'login');
-        $this->telegramService->sendMessage($message->chat_id, $text);
+        $this->sendMarkdown($message->chat_id, $text);
     }
 }

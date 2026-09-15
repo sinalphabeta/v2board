@@ -30,6 +30,6 @@ class SendRiskTelegramJob implements ShouldQueue
     {
         $token = (string)config('risk.bot_token', '');
         if (!$token) return;
-        (new TelegramService($token))->sendMessage($this->telegramId, $this->text);
+        (new TelegramService($token))->sendMessage($this->telegramId, $this->text, 'MarkdownV2');
     }
 }
