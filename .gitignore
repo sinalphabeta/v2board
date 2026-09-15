@@ -7,6 +7,7 @@
 /public/assets/admin/custom.css
 /storage/*.key
 /storage/app/ip2region/
+/storage/app/risk-geoip/
 /vendor
 .env
 .env.backup

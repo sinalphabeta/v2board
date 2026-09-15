@@ -16,16 +16,17 @@
         "firebase/php-jwt": "^6.3@stable || ^7.0",
         "google/recaptcha": "^1.2",
         "guzzlehttp/guzzle": "^7.4.3",
+        "ipip/db": "^1.0",
         "laravel/framework": "^8.0",
         "laravel/horizon": "^5.9.6",
         "laravel/tinker": "^2.5",
         "linfo/linfo": "^4.0",
+        "maxmind-db/reader": "^1.12",
         "paragonie/sodium_compat": "^1.20",
         "php-curl-class/php-curl-class": "^8.6",
         "rybakit/msgpack": "^0.9.1",
         "stripe/stripe-php": "^v14.9.0",
-        "symfony/yaml": "^4.3",
-        "zoujingli/ip2region": "^3.0"
+        "symfony/yaml": "^4.3"
     },
     "require-dev": {
         "facade/ignition": "^2.3.6",

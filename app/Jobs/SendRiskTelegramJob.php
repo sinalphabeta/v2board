@@ -38,8 +38,12 @@ class SendRiskTelegramJob implements ShouldQueue
             $ipLine = "\nip: " . $this->markdownCode($this->ip);
             $position = strpos($text, $ipLine);
             if ($position !== false) {
-                $infoLine = "\nip\\_info: " . $this->markdownCode($ipInfoService->describe($this->ip));
-                $text = substr_replace($text, $ipLine . $infoLine, $position, strlen($ipLine));
+                $result = $ipInfoService->lookup($this->ip);
+                $infoLines = "\nip\\_info: " . $this->markdownCode($result['ip_info']);
+                if ($result['asn'] !== null) {
+                    $infoLines .= "\nasn: " . $this->markdownCode($result['asn']);
+                }
+                $text = substr_replace($text, $ipLine . $infoLines, $position, strlen($ipLine));
             }
         }
         (new TelegramService($token))->sendMessage($this->telegramId, $text, 'MarkdownV2');
