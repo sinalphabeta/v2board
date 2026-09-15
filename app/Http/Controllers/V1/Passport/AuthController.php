@@ -11,6 +11,7 @@ use App\Models\InviteCode;
 use App\Models\Plan;
 use App\Models\User;
 use App\Services\AuthService;
+use App\Services\RiskService;
 use App\Utils\CacheKey;
 use App\Utils\Dict;
 use App\Utils\Helper;
@@ -22,6 +23,7 @@ class AuthController extends Controller
 {
     public function register(AuthRegister $request)
     {
+        $riskService = new RiskService();
         if ((int)config('v2board.register_limit_by_ip_enable', 0)) {
             $registerCountByIP = Cache::get(CacheKey::get('REGISTER_IP_RATE_LIMIT', $request->ip())) ?? 0;
             if ((int)$registerCountByIP >= (int)config('v2board.register_limit_count', 3)) {
@@ -120,6 +122,7 @@ class AuthController extends Controller
 
         $user->last_login_at = time();
         $user->save();
+        $riskService->observe($user, 'register', $request, true);
 
         if ((int)config('v2board.register_limit_by_ip_enable', 0)) {
             Cache::put(
@@ -138,6 +141,7 @@ class AuthController extends Controller
 
     public function login(AuthLogin $request)
     {
+        $riskService = new RiskService();
         $email = $request->input('email');
         $password = $request->input('password');
 
@@ -175,6 +179,7 @@ class AuthController extends Controller
         }
 
         $authService = new AuthService($user);
+        $riskService->observe($user, 'login', $request, false);
         return response([
             'data' => $authService->generateAuthData($request)
         ]);
@@ -207,6 +212,7 @@ class AuthController extends Controller
             }
             Cache::forget($key);
             $authService = new AuthService($user);
+            (new RiskService())->observe($user, 'login', $request, false);
             return response([
                 'data' => $authService->generateAuthData($request)
             ]);

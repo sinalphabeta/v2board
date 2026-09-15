@@ -19,6 +19,18 @@ use Illuminate\Support\Facades\Cache;
 
 class ServerService
 {
+    private function userGroups(User $user): array
+    {
+        $honeypot = (int)env('RISK_HONEYPOT_GROUP_ID', 0);
+        if ((int)$user->risk_status === 1) return $honeypot > 0 ? [$honeypot] : [];
+        return $user->group_id === null ? [] : [(int)$user->group_id];
+    }
+
+    private function canAccess(User $user, $groups): bool
+    {
+        return (bool)array_intersect($this->userGroups($user), array_map('intval', (array)$groups));
+    }
+
     public function getAvailableVless(User $user): array
     {
         $servers = [];
@@ -27,7 +39,7 @@ class ServerService
         foreach ($server as $key => $v) {
             if (!$v['show']) continue;
             $server[$key]['type'] = 'vless';
-            if (!in_array($user->group_id, $server[$key]['group_id'])) continue;
+            if (!$this->canAccess($user, $server[$key]['group_id'])) continue;
             if (strpos($server[$key]['port'], '-') !== false) {
                 $server[$key]['port'] = Helper::randomPort($server[$key]['port']);
             }
@@ -64,7 +76,7 @@ class ServerService
         foreach ($vmess as $key => $v) {
             if (!$v['show']) continue;
             $vmess[$key]['type'] = 'vmess';
-            if (!in_array($user->group_id, $vmess[$key]['group_id'])) continue;
+            if (!$this->canAccess($user, $vmess[$key]['group_id'])) continue;
             if (strpos($vmess[$key]['port'], '-') !== false) {
                 $vmess[$key]['port'] = Helper::randomPort($vmess[$key]['port']);
             }
@@ -88,7 +100,7 @@ class ServerService
         foreach ($trojan as $key => $v) {
             if (!$v['show']) continue;
             $trojan[$key]['type'] = 'trojan';
-            if (!in_array($user->group_id, $trojan[$key]['group_id'])) continue;
+            if (!$this->canAccess($user, $trojan[$key]['group_id'])) continue;
             if (strpos($trojan[$key]['port'], '-') !== false) {
                 $trojan[$key]['port'] = Helper::randomPort($trojan[$key]['port']);
             }
@@ -111,7 +123,7 @@ class ServerService
             if (!$v['show']) continue;
             $servers[$key]['type'] = 'tuic';
             $servers[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_TUIC_LAST_CHECK_AT', $v['id']));
-            if (!in_array($user->group_id, $v['group_id'])) continue;
+            if (!$this->canAccess($user, $v['group_id'])) continue;
             if (isset($servers[$v['parent_id']])) {
                 $servers[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_TUIC_LAST_CHECK_AT', $v['parent_id']));
                 $servers[$key]['created_at'] = $servers[$v['parent_id']]['created_at'];
@@ -130,7 +142,7 @@ class ServerService
             if (!$v['show']) continue;
             $servers[$key]['type'] = 'hysteria';
             $servers[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_HYSTERIA_LAST_CHECK_AT', $v['id']));
-            if (!in_array($user->group_id, $v['group_id'])) continue;
+            if (!$this->canAccess($user, $v['group_id'])) continue;
             if (isset($servers[$v['parent_id']])) {
                 $servers[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_HYSTERIA_LAST_CHECK_AT', $v['parent_id']));
                 $servers[$key]['created_at'] = $servers[$v['parent_id']]['created_at'];
@@ -150,7 +162,7 @@ class ServerService
             if (!$v['show']) continue;
             $shadowsocks[$key]['type'] = 'shadowsocks';
             $shadowsocks[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_SHADOWSOCKS_LAST_CHECK_AT', $v['id']));
-            if (!in_array($user->group_id, $v['group_id'])) continue;
+            if (!$this->canAccess($user, $v['group_id'])) continue;
             if (strpos($v['port'], '-') !== false) {
                 $shadowsocks[$key]['port'] = Helper::randomPort($v['port']);
             }
@@ -177,7 +189,7 @@ class ServerService
             if (!$v['show']) continue;
             $anytls[$key]['type'] = 'anytls';
             $anytls[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_ANYTLS_LAST_CHECK_AT', $v['id']));
-            if (!in_array($user->group_id, $v['group_id'])) continue;
+            if (!$this->canAccess($user, $v['group_id'])) continue;
             if (strpos($v['port'], '-') !== false) {
                 $anytls[$key]['port'] = Helper::randomPort($v['port']);
             }
@@ -199,7 +211,7 @@ class ServerService
             if (!$v['show']) continue;
             $v2node[$key]['type'] = 'v2node';
             $v2node[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_V2NODE_LAST_CHECK_AT', $v['id']));
-            if (!in_array($user->group_id, $v['group_id'])) continue;
+            if (!$this->canAccess($user, $v['group_id'])) continue;
             if (isset($v2node[$v['parent_id']])) {
                 $v2node[$key]['last_check_at'] = Cache::get(CacheKey::get('SERVER_V2NODE_LAST_CHECK_AT', $v['parent_id']));
                 $v2node[$key]['created_at'] = $v2node[$v['parent_id']]['created_at'];
@@ -250,7 +262,21 @@ class ServerService
 
     public function getAvailableUsers($groupId)
     {
-        return User::whereIn('group_id', $groupId)
+        $groups = is_array($groupId) ? array_map('intval', $groupId) : [(int)$groupId];
+        $honeypot = (int)env('RISK_HONEYPOT_GROUP_ID', 0);
+        $query = User::where(function ($q) use ($groups, $honeypot) {
+            if ($honeypot > 0 && in_array($honeypot, $groups, true)) {
+                $ordinary = array_values(array_diff($groups, [$honeypot]));
+                $q->where('risk_status', 1);
+                if ($ordinary) $q->orWhere(function ($oq) use ($ordinary) {
+                    $oq->whereIn('group_id', $ordinary)->where(function ($rq) { $rq->whereNull('risk_status')->orWhere('risk_status', '!=', 1); });
+                });
+            } else {
+                $q->whereIn('group_id', $groups)
+                    ->where(function ($rq) { $rq->whereNull('risk_status')->orWhere('risk_status', '!=', 1); });
+            }
+        });
+        return $query
             ->whereRaw('u + d < transfer_enable')
             ->where(function ($query) {
                 $query->where('expired_at', '>=', time())

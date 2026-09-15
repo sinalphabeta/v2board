@@ -859,3 +859,50 @@ CHANGE `action_value` `action_value` text NULL AFTER `action`;
 
 ALTER TABLE `v2_server_v2node`
 ADD `trusted_x_forwarded_for` varchar(255) COLLATE 'utf8mb4_general_ci' NULL COMMENT '信任的x-forwarded-for头部' AFTER `network_settings`;
+
+ALTER TABLE `v2_user`
+ADD `risk_status` tinyint(1) NOT NULL DEFAULT '0' COMMENT 'risk isolation status' AFTER `is_staff`,
+ADD `risk_indicator_id` int(11) NULL AFTER `risk_status`,
+ADD `risk_marked_at` int(11) NULL AFTER `risk_indicator_id`;
+
+CREATE TABLE IF NOT EXISTS `v2_risk_indicator` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `type` varchar(16) NOT NULL,
+  `value` varchar(255) NOT NULL,
+  `note` varchar(255) DEFAULT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `created_at` int(11) NOT NULL,
+  `updated_at` int(11) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `risk_indicator_type_value` (`type`,`value`),
+  KEY `risk_indicator_enabled` (`enabled`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `v2_risk_audit` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `actor_id` int(11) DEFAULT NULL,
+  `action` varchar(16) NOT NULL,
+  `indicator_id` int(11) DEFAULT NULL,
+  `type` varchar(16) NOT NULL,
+  `value` varchar(255) NOT NULL,
+  `created_at` int(11) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `risk_audit_created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `v2_risk_event` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `fingerprint` char(64) NOT NULL,
+  `user_id` int(11) DEFAULT NULL,
+  `event_type` varchar(32) NOT NULL,
+  `ip` varchar(45) NOT NULL,
+  `user_agent` varchar(512) NOT NULL,
+  `indicator_ids` text,
+  `first_seen_at` int(11) NOT NULL,
+  `last_seen_at` int(11) NOT NULL,
+  `occurrences` int(11) NOT NULL DEFAULT '1',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `risk_event_fingerprint` (`fingerprint`),
+  KEY `risk_event_last_seen` (`last_seen_at`),
+  KEY `risk_event_user_type_seen` (`user_id`,`event_type`,`last_seen_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

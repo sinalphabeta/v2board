@@ -6,6 +6,7 @@ use Closure;
 use App\Models\User;
 use App\Utils\Helper;
 use Illuminate\Support\Facades\Cache;
+use App\Services\RiskService;
 
 class Client
 {
@@ -72,6 +73,7 @@ class Client
         $request->merge([
             'user' => $user
         ]);
+        (new RiskService())->observe($user, 'subscription', $request, false);
         return $next($request);
     }
 }

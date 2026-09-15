@@ -567,6 +567,9 @@ CREATE TABLE `v2_user` (
                            `is_admin` tinyint(1) NOT NULL DEFAULT '0',
                            `last_login_at` int(11) DEFAULT NULL,
                            `is_staff` tinyint(1) NOT NULL DEFAULT '0',
+                           `risk_status` tinyint(1) NOT NULL DEFAULT '0',
+                           `risk_indicator_id` int(11) DEFAULT NULL,
+                           `risk_marked_at` int(11) DEFAULT NULL,
                            `last_login_ip` int(11) DEFAULT NULL,
                            `uuid` varchar(36) NOT NULL,
                            `group_id` int(11) DEFAULT NULL,
@@ -584,6 +587,42 @@ CREATE TABLE `v2_user` (
                            UNIQUE KEY `email` (`email`),
                            UNIQUE KEY `token` (`token`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+CREATE TABLE `v2_risk_indicator` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `type` varchar(16) NOT NULL,
+  `value` varchar(255) NOT NULL,
+  `note` varchar(255) DEFAULT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `created_at` int(11) NOT NULL,
+  `updated_at` int(11) NOT NULL,
+  PRIMARY KEY (`id`), UNIQUE KEY `risk_indicator_type_value` (`type`,`value`), KEY `risk_indicator_enabled` (`enabled`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE `v2_risk_audit` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `actor_id` int(11) DEFAULT NULL,
+  `action` varchar(16) NOT NULL,
+  `indicator_id` int(11) DEFAULT NULL,
+  `type` varchar(16) NOT NULL,
+  `value` varchar(255) NOT NULL,
+  `created_at` int(11) NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE `v2_risk_event` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `fingerprint` char(64) NOT NULL,
+  `user_id` int(11) DEFAULT NULL,
+  `event_type` varchar(32) NOT NULL,
+  `ip` varchar(45) NOT NULL,
+  `user_agent` varchar(512) NOT NULL,
+  `indicator_ids` text,
+  `first_seen_at` int(11) NOT NULL,
+  `last_seen_at` int(11) NOT NULL,
+  `occurrences` int(11) NOT NULL DEFAULT '1',
+  PRIMARY KEY (`id`), UNIQUE KEY `risk_event_fingerprint` (`fingerprint`), KEY `risk_event_last_seen` (`last_seen_at`), KEY `risk_event_user_type_seen` (`user_id`,`event_type`,`last_seen_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
 -- 2025-09-12 10:05:00
