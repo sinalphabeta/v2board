@@ -71,6 +71,7 @@ class Kernel extends HttpKernel
         'client' => \App\Http\Middleware\Client::class,
         'staff' => \App\Http\Middleware\Staff::class,
         'log' => \App\Http\Middleware\RequestLog::class
+        ,'risk.api' => \App\Http\Middleware\RiskApiKey::class
     ];
 
     /**

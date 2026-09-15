@@ -11,18 +11,41 @@ class TelegramService {
 
     public function __construct($token = '')
     {
-        $this->api = 'https://api.telegram.org/bot' . config('v2board.telegram_bot_token', $token) . '/';
+        $this->api = 'https://api.telegram.org/bot' . ($token ?: config('v2board.telegram_bot_token')) . '/';
     }
 
-    public function sendMessage(int $chatId, string $text, string $parseMode = '')
+    public function sendMessage(int $chatId, string $text, string $parseMode = '', array $replyMarkup = [])
     {
         if ($parseMode === 'markdown') {
             $text = str_replace('_', '\_', $text);
         }
-        $this->request('sendMessage', [
+        $params = [
             'chat_id' => $chatId,
             'text' => $text,
             'parse_mode' => $parseMode
+        ];
+        if ($replyMarkup) $params['reply_markup'] = json_encode($replyMarkup, JSON_UNESCAPED_UNICODE);
+        return $this->request('sendMessage', $params);
+    }
+
+    public function editMessageText(int $chatId, int $messageId, string $text, string $parseMode = '', array $replyMarkup = [])
+    {
+        if ($parseMode === 'markdown') $text = str_replace('_', '\\_', $text);
+        $params = [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'text' => $text,
+            'parse_mode' => $parseMode
+        ];
+        if ($replyMarkup) $params['reply_markup'] = json_encode($replyMarkup, JSON_UNESCAPED_UNICODE);
+        return $this->request('editMessageText', $params);
+    }
+
+    public function answerCallbackQuery(string $callbackQueryId, string $text = '')
+    {
+        return $this->request('answerCallbackQuery', [
+            'callback_query_id' => $callbackQueryId,
+            'text' => $text
         ]);
     }
 
@@ -47,13 +70,13 @@ class TelegramService {
         return $this->request('getMe');
     }
 
-    public function setWebhook(string $url)
+    public function setWebhook(string $url, string $secretToken = '')
     {
         $commands = $this->discoverCommands(base_path('app/Plugins/Telegram/Commands'));
         $this->setMyCommands($commands);
-        return $this->request('setWebhook', [
-            'url' => $url
-        ]);
+        $params = ['url' => $url];
+        if ($secretToken !== '') $params['secret_token'] = $secretToken;
+        return $this->request('setWebhook', $params);
     }
 
     public function discoverCommands(string $directory): array
@@ -111,7 +134,7 @@ class TelegramService {
     private function request(string $method, array $params = [])
     {
         $curl = new Curl();
-        $curl->get($this->api . $method . '?' . http_build_query($params));
+        $curl->post($this->api . $method, $params);
         $response = $curl->response;
         $curl->close();
         if (!isset($response->ok)) abort(500, '请求失败');

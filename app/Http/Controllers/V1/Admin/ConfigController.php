@@ -65,6 +65,17 @@ class ConfigController extends Controller
         ]);
     }
 
+    public function setRiskTelegramWebhook(Request $request)
+    {
+        $token = (string)env('RISK_BOT_TOKEN', '');
+        if (!$token) abort(422, 'Risk bot token is required');
+        $hookUrl = secure_url('/api/v1/guest/risk/telegram/webhook');
+        $telegramService = new TelegramService($token);
+        $telegramService->getMe();
+        $telegramService->setWebhook($hookUrl, hash('sha256', $token));
+        return response(['data' => true]);
+    }
+
     public function fetch(Request $request)
     {
         $key = $request->input('key');

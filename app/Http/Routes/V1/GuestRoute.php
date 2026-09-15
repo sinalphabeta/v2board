@@ -12,6 +12,7 @@ class GuestRoute
         ], function ($router) {
             // Telegram
             $router->post('/telegram/webhook', 'V1\\Guest\\TelegramController@webhook');
+            $router->post('/risk/telegram/webhook', 'V1\\Guest\\RiskTelegramController@webhook');
             // Payment
             $router->match(['get', 'post'], '/payment/notify/{method}/{uuid}', 'V1\\Guest\\PaymentController@notify');
             // Comm

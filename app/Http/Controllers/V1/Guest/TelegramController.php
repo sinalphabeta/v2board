@@ -47,6 +47,8 @@ class TelegramController extends Controller
                 $command = basename($file, '.php');
                 $class = '\\App\\Plugins\\Telegram\\Commands\\' . $command;
                 if (!class_exists($class)) continue;
+                if ($class === \App\Plugins\Telegram\Commands\RiskCommand::class
+                    || is_subclass_of($class, \App\Plugins\Telegram\Commands\RiskCommand::class)) continue;
                 $instance = new $class();
                 if ($msg->message_type === 'message') {
                     if (!isset($instance->command)) continue;
