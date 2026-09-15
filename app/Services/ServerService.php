@@ -21,7 +21,7 @@ class ServerService
 {
     private function userGroups(User $user): array
     {
-        $honeypot = (int)env('RISK_HONEYPOT_GROUP_ID', 0);
+        $honeypot = (int)config('risk.honeypot_group_id', 0);
         if ((int)$user->risk_status === 1) return $honeypot > 0 ? [$honeypot] : [];
         return $user->group_id === null ? [] : [(int)$user->group_id];
     }
@@ -263,7 +263,7 @@ class ServerService
     public function getAvailableUsers($groupId)
     {
         $groups = is_array($groupId) ? array_map('intval', $groupId) : [(int)$groupId];
-        $honeypot = (int)env('RISK_HONEYPOT_GROUP_ID', 0);
+        $honeypot = (int)config('risk.honeypot_group_id', 0);
         $query = User::where(function ($q) use ($groups, $honeypot) {
             if ($honeypot > 0 && in_array($honeypot, $groups, true)) {
                 $ordinary = array_values(array_diff($groups, [$honeypot]));

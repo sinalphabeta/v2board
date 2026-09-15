@@ -11,7 +11,7 @@ class RiskTelegramController extends Controller
 {
     public function webhook(Request $request)
     {
-        $token = (string)env('RISK_BOT_TOKEN', '');
+        $token = (string)config('risk.bot_token', '');
         $headerSecret = (string)$request->header('X-Telegram-Bot-Api-Secret-Token', '');
         $validHeader = $token && $headerSecret && hash_equals(hash('sha256', $token), $headerSecret);
         if (!$validHeader) abort(401);

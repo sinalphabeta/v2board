@@ -13,7 +13,7 @@ class RiskApiKey
         if (RateLimiter::tooManyAttempts($key, 60)) abort(429, 'Too many requests');
         RateLimiter::hit($key, 60);
         $provided = (string)$request->header('X-API-Key', '');
-        $stored = (string)env('RISK_API_KEY_HASH', '');
+        $stored = (string)config('risk.api_key_hash', '');
         if (!$provided || !$stored || !hash_equals($stored, hash('sha256', $provided))) abort(401, 'Invalid API key');
         return $next($request);
     }

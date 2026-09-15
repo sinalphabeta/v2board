@@ -15,12 +15,12 @@ abstract class RiskCommand extends Telegram
 
     public function __construct()
     {
-        $this->telegramService = new TelegramService(env('RISK_BOT_TOKEN', ''));
+        $this->telegramService = new TelegramService(config('risk.bot_token', ''));
     }
 
     protected function authorized($message): bool
     {
-        $alertChatId = (string)env('RISK_ALERT_CHAT_ID', '');
+        $alertChatId = (string)config('risk.alert_chat_id', '');
         if (empty($message->is_private) && (!$alertChatId || (string)$message->chat_id !== $alertChatId)) {
             $this->telegramService->sendMessage($message->chat_id, '请私聊风险 Bot 执行此命令');
             return false;

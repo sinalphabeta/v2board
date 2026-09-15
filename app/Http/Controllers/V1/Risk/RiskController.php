@@ -79,9 +79,9 @@ class RiskController extends Controller
     {
         $mixedNodes = (new RiskService())->mixedHoneypotNodes();
         return response(['data' => [
-            'honeypot_group_id' => (int)env('RISK_HONEYPOT_GROUP_ID', 0),
-            'api_key_configured' => (bool)env('RISK_API_KEY_HASH', ''),
-            'alert_configured' => (bool)env('RISK_ALERT_CHAT_ID', ''),
+            'honeypot_group_id' => (int)config('risk.honeypot_group_id', 0),
+            'api_key_configured' => (bool)config('risk.api_key_hash', ''),
+            'alert_configured' => (bool)config('risk.alert_chat_id', ''),
             'indicators' => RiskIndicator::where('enabled', 1)->count(),
             'events_24h' => RiskEvent::where('last_seen_at', '>=', time() - 86400)->count(),
             'mixed_honeypot_nodes' => $mixedNodes,

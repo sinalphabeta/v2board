@@ -33,7 +33,7 @@ class RiskService
     public function clientIp(Request $request): string
     {
         $remote = (string)$request->server('REMOTE_ADDR', '');
-        $trusted = env('TRUSTED_PROXIES', '');
+        $trusted = config('risk.trusted_proxies', '');
         if (!is_array($trusted)) $trusted = array_filter(array_map('trim', explode(',', (string)$trusted)));
         if ($remote && $this->ipMatchesAny($remote, $trusted)) {
             foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR'] as $header) {
@@ -166,7 +166,7 @@ class RiskService
     public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = []): void
     {
         $ua = substr((string)preg_replace('/[\x00-\x1F\x7F]+/', ' ', $ua), 0, 240);
-        $chatId = env('RISK_ALERT_CHAT_ID', '');
+        $chatId = config('risk.alert_chat_id', '');
         if (!$chatId) return;
         $plan = $user && $user->plan_id ? Plan::find($user->plan_id) : null;
         $rules = is_array($matches)
@@ -175,7 +175,7 @@ class RiskService
         $text = "[Risk] {$eventType}\nuser_id=" . ($user ? $user->id : '-') .
             "\nemail=" . ($user ? $user->email : '-') . "\nip={$ip}\nua={$ua}" .
             "\nplan=" . ($plan ? $plan->name : '-') . "\ngroup=" . ($user ? $user->group_id : '-') . "\nrules={$rules}";
-        $token = (string)env('RISK_BOT_TOKEN', '');
+        $token = (string)config('risk.bot_token', '');
         if (!$token) return;
         try { SendRiskTelegramJob::dispatch((int)$chatId, $text); } catch (\Throwable $e) { /* queue unavailable */ }
     }
@@ -253,7 +253,7 @@ class RiskService
      */
     public function mixedHoneypotNodes(): array
     {
-        $honeypot = (int)env('RISK_HONEYPOT_GROUP_ID', 0);
+        $honeypot = (int)config('risk.honeypot_group_id', 0);
         if ($honeypot <= 0) return [];
 
         $models = [

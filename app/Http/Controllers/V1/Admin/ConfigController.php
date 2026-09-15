@@ -67,7 +67,7 @@ class ConfigController extends Controller
 
     public function setRiskTelegramWebhook(Request $request)
     {
-        $token = (string)env('RISK_BOT_TOKEN', '');
+        $token = (string)config('risk.bot_token', '');
         if (!$token) abort(422, 'Risk bot token is required');
         $hookUrl = secure_url('/api/v1/guest/risk/telegram/webhook');
         $telegramService = new TelegramService($token);
