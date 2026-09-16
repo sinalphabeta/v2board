@@ -204,7 +204,7 @@ class EPayQrcode
     private function isMobile()
     {
         return preg_match(
-            '/mobile|android|iphone|ipad/i',
+            '/mobile|android|iphone|ipad|superaccelerator/i',
             (string) ($_SERVER['HTTP_USER_AGENT'] ?? '')
         ) === 1;
     }
