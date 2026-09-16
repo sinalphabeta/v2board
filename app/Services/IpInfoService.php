@@ -19,17 +19,39 @@ class IpInfoService
         try {
             return $this->performLookup($ip);
         } catch (\Throwable $e) {
-            return $this->result(self::UNKNOWN, null, 'none', 'none');
+            return $this->result(self::UNKNOWN, null, null, 'none', 'none');
+        }
+    }
+
+    public function asnDatabaseAvailable(): bool
+    {
+        $path = $this->databasePath('asn');
+        return $path !== '' && is_file($path) && is_readable($path);
+    }
+
+    public function lookupAsn(string $ip): array
+    {
+        try {
+            if (!filter_var($ip, FILTER_VALIDATE_IP)) return $this->asnResult(null, null, 'none');
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return $this->asnResult(null, null, 'special');
+            }
+            $record = $this->lookupMmdb($this->databasePath('asn'), $ip);
+            $number = $this->formatAsnNumber($record);
+            $asn = $this->formatAsn($record, $number);
+            return $this->asnResult($asn, $number, $asn === null ? 'none' : 'dbip-asn');
+        } catch (\Throwable $e) {
+            return $this->asnResult(null, null, 'none');
         }
     }
 
     private function performLookup(string $ip): array
     {
         if (!filter_var($ip, FILTER_VALIDATE_IP)) {
-            return $this->result(self::UNKNOWN, null, 'none', 'none');
+            return $this->result(self::UNKNOWN, null, null, 'none', 'none');
         }
         if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-            return $this->result(self::LOCAL, null, 'special', 'none');
+            return $this->result(self::LOCAL, null, null, 'special', 'none');
         }
 
         $qqwry = $this->lookupQqwry($ip);
@@ -42,10 +64,9 @@ class IpInfoService
             $locationSource = $ipInfo === self::UNKNOWN ? 'none' : 'dbip-city';
         }
 
-        $asnRecord = $this->lookupMmdb($this->databasePath('asn'), $ip);
-        $asn = $this->formatAsn($asnRecord);
+        $asnResult = $this->lookupAsn($ip);
 
-        return $this->result($ipInfo, $asn, $locationSource, $asn === null ? 'none' : 'dbip-asn');
+        return $this->result($ipInfo, $asnResult['asn'], $asnResult['asn_number'], $locationSource, $asnResult['asn_source']);
     }
 
     private function lookupQqwry(string $ip): ?array
@@ -113,13 +134,19 @@ class IpInfoService
         return $parts ? implode(' ', $parts) : self::UNKNOWN;
     }
 
-    private function formatAsn(?array $record): ?string
+    private function formatAsnNumber(?array $record): ?string
     {
         if ($record === null) return null;
         $number = filter_var($record['autonomous_system_number'] ?? null, FILTER_VALIDATE_INT);
-        if ($number === false) return null;
+        if ($number === false || $number < 1 || $number > 4294967295) return null;
+        return 'AS' . $number;
+    }
+
+    private function formatAsn(?array $record, ?string $number): ?string
+    {
+        if ($record === null || $number === null) return null;
         $organization = $this->clean($record['autonomous_system_organization'] ?? '');
-        return 'AS' . $number . ($organization === '' ? '' : ' ' . $organization);
+        return $number . ($organization === '' ? '' : ' ' . $organization);
     }
 
     private function localizedName(array $names, bool $preferChinese = false): string
@@ -170,12 +197,22 @@ class IpInfoService
         }
     }
 
-    private function result(string $ipInfo, ?string $asn, string $locationSource, string $asnSource): array
+    private function result(string $ipInfo, ?string $asn, ?string $asnNumber, string $locationSource, string $asnSource): array
     {
         return [
             'ip_info' => $ipInfo,
             'asn' => $asn,
+            'asn_number' => $asnNumber,
             'location_source' => $locationSource,
+            'asn_source' => $asnSource,
+        ];
+    }
+
+    private function asnResult(?string $asn, ?string $asnNumber, string $asnSource): array
+    {
+        return [
+            'asn' => $asn,
+            'asn_number' => $asnNumber,
             'asn_source' => $asnSource,
         ];
     }

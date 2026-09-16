@@ -6,6 +6,7 @@ return [
     'bot_token' => env('RISK_BOT_TOKEN', ''),
     'honeypot_group_id' => env('RISK_HONEYPOT_GROUP_ID', 0),
     'ip_info_enabled' => env('RISK_IP_INFO_ENABLED', true),
+    'asn_cache_ttl' => env('RISK_ASN_CACHE_TTL', 3600),
     'geoip_directory' => storage_path('app/risk-geoip'),
     'geoip_databases' => [
         'qqwry' => storage_path('app/risk-geoip/qqwry.ipdb'),

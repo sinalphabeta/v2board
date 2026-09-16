@@ -43,7 +43,9 @@ abstract class RiskCommand extends Telegram
         $existing = [];
         $invalid = [];
         foreach ($values as $rawValue) {
-            $value = $type === 'email' ? $service->normalizeEmail($rawValue) : trim((string)$rawValue);
+            if ($type === 'email') $value = $service->normalizeEmail($rawValue);
+            elseif ($type === 'asn') $value = $service->normalizeAsn($rawValue) ?: trim((string)$rawValue);
+            else $value = trim((string)$rawValue);
             if (!$this->validIndicatorValue($type, $value)) {
                 $invalid[] = $value;
                 continue;
@@ -86,7 +88,9 @@ abstract class RiskCommand extends Telegram
         $deleted = [];
         $missing = [];
         foreach ($values as $rawValue) {
-            $value = $type === 'email' ? $service->normalizeEmail($rawValue) : trim((string)$rawValue);
+            if ($type === 'email') $value = $service->normalizeEmail($rawValue);
+            elseif ($type === 'asn') $value = $service->normalizeAsn($rawValue) ?: trim((string)$rawValue);
+            else $value = trim((string)$rawValue);
             $indicator = RiskIndicator::where('type', $type)->where('value', $value)->where('enabled', 1)->first();
             if (!$indicator) {
                 $missing[] = $value;
@@ -178,6 +182,7 @@ abstract class RiskCommand extends Telegram
     {
         if ($value === '' || strlen($value) > 255) return false;
         if ($type === 'email') return (bool)filter_var($value, FILTER_VALIDATE_EMAIL);
+        if ($type === 'asn') return (new RiskService())->normalizeAsn($value) !== null;
         if ($type !== 'ip') return true;
         [$address, $bits] = array_pad(explode('/', $value, 2), 2, null);
         if (!filter_var($address, FILTER_VALIDATE_IP)) return false;

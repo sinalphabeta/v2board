@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\RiskAudit;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
+use App\Services\IpInfoService;
 use App\Services\RiskService;
 use Illuminate\Http\Request;
 
@@ -24,7 +25,7 @@ class RiskController extends Controller
         $type = is_string($rawType) ? $rawType : '';
         $rawValue = $request->input('value');
         $value = is_string($rawValue) ? $rawValue : '';
-        if (!in_array($type, ['email', 'ip', 'ua'], true) || $value === '') abort(422, 'Invalid indicator');
+        if (!in_array($type, ['email', 'ip', 'ua', 'asn'], true) || $value === '') abort(422, 'Invalid indicator');
         $this->validateValue($type, $value);
         $note = $request->input('note');
         if ($note !== null && !is_string($note)) abort(422, 'Invalid note');
@@ -39,7 +40,10 @@ class RiskController extends Controller
         $data = $request->only(['value', 'note', 'enabled']);
         if (isset($data['value'])) {
             if (!is_string($data['value'])) abort(422, 'Invalid indicator value');
-            $data['value'] = $indicator->type === 'email' ? (new RiskService())->normalizeEmail($data['value']) : trim($data['value']);
+            $riskService = new RiskService();
+            if ($indicator->type === 'email') $data['value'] = $riskService->normalizeEmail($data['value']);
+            elseif ($indicator->type === 'asn') $data['value'] = (string)$riskService->normalizeAsn($data['value']);
+            else $data['value'] = trim($data['value']);
             $this->validateValue($indicator->type, $data['value']);
         }
         if (array_key_exists('note', $data)) {
@@ -78,14 +82,21 @@ class RiskController extends Controller
     public function health()
     {
         $mixedNodes = (new RiskService())->mixedHoneypotNodes();
+        $asnIndicators = RiskIndicator::where('type', 'asn')->where('enabled', 1)->count();
+        $asnDatabaseAvailable = (new IpInfoService())->asnDatabaseAvailable();
+        $warnings = [];
+        if ($mixedNodes) $warnings[] = 'mixed_honeypot_nodes';
+        if ($asnIndicators && !$asnDatabaseAvailable) $warnings[] = 'asn_database_unavailable';
         return response(['data' => [
             'honeypot_group_id' => (int)config('risk.honeypot_group_id', 0),
             'api_key_configured' => (bool)config('risk.api_key_hash', ''),
             'alert_configured' => (bool)config('risk.alert_chat_id', ''),
             'indicators' => RiskIndicator::where('enabled', 1)->count(),
+            'asn_indicators' => $asnIndicators,
+            'asn_database_available' => $asnDatabaseAvailable,
             'events_24h' => RiskEvent::where('last_seen_at', '>=', time() - 86400)->count(),
             'mixed_honeypot_nodes' => $mixedNodes,
-            'warnings' => $mixedNodes ? ['mixed_honeypot_nodes'] : []
+            'warnings' => $warnings
         ]]);
     }
 
@@ -98,6 +109,7 @@ class RiskController extends Controller
     {
         if (strlen($value) > 255) abort(422, 'Indicator value is too long');
         if ($type === 'email' && !filter_var($value, FILTER_VALIDATE_EMAIL)) abort(422, 'Invalid email');
+        if ($type === 'asn' && (new RiskService())->normalizeAsn($value) === null) abort(422, 'Invalid ASN');
         if ($type !== 'ip') return;
         [$address, $bits] = array_pad(explode('/', $value, 2), 2, null);
         $max = filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? 128 : 32;

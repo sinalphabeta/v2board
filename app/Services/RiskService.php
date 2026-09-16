@@ -24,10 +24,27 @@ class RiskService
     public const STATUS_NONE = 0;
     public const STATUS_RISK = 1;
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
+    private $ipInfoService;
+
+    public function __construct(?IpInfoService $ipInfoService = null)
+    {
+        $this->ipInfoService = $ipInfoService ?: app(IpInfoService::class);
+    }
 
     public function normalizeEmail($email): string
     {
         return strtolower(trim((string)$email));
+    }
+
+    public function normalizeAsn($value): ?string
+    {
+        $value = trim((string)$value);
+        if (!preg_match('/^(?:AS)?([0-9]+)$/i', $value, $matches)) return null;
+        $number = ltrim($matches[1], '0');
+        if ($number === '') $number = '0';
+        if ($number === '0' || strlen($number) > 10) return null;
+        if (strlen($number) === 10 && strcmp($number, '4294967295') > 0) return null;
+        return 'AS' . $number;
     }
 
     public function clientIp(Request $request): string
@@ -66,6 +83,13 @@ class RiskService
         }
         $email = $this->normalizeEmail($email);
         $ua = strtolower($ua);
+        $asn = null;
+        foreach ($indicators as $indicator) {
+            if ($indicator->type === 'asn') {
+                $asn = $this->lookupAsn($ip);
+                break;
+            }
+        }
         $matches = [];
         foreach ($indicators as $indicator) {
             $value = trim((string)$indicator->value);
@@ -74,6 +98,7 @@ class RiskService
             if ($indicator->type === 'email') $matched = $email !== '' && $email === $this->normalizeEmail($value);
             if ($indicator->type === 'ua') $matched = $ua !== '' && strpos($ua, strtolower($value)) !== false;
             if ($indicator->type === 'ip') $matched = $this->ipMatches($ip, $value);
+            if ($indicator->type === 'asn') $matched = $asn !== null && $asn === $this->normalizeAsn($value);
             if ($matched) $matches[] = $indicator;
         }
         return $matches;
@@ -191,7 +216,9 @@ class RiskService
 
     public function addIndicator(string $type, string $value, ?string $note = null, ?int $actorId = null): RiskIndicator
     {
-        $value = $type === 'email' ? $this->normalizeEmail($value) : trim($value);
+        if ($type === 'email') $value = $this->normalizeEmail($value);
+        elseif ($type === 'asn') $value = (string)$this->normalizeAsn($value);
+        else $value = trim($value);
         $indicator = RiskIndicator::updateOrCreate(['type' => $type, 'value' => $value], ['note' => $note, 'enabled' => 1]);
         Cache::forget(self::INDICATORS_CACHE_KEY);
         $this->audit('add', $indicator, $actorId);
@@ -315,5 +342,24 @@ class RiskService
     {
         foreach ($rules as $rule) if ($this->ipMatches($ip, trim((string)$rule))) return true;
         return false;
+    }
+
+    private function lookupAsn(string $ip): ?string
+    {
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return null;
+
+        $lookup = function () use ($ip): array {
+            $result = $this->ipInfoService->lookupAsn($ip);
+            return ['asn_number' => $this->normalizeAsn($result['asn_number'] ?? null)];
+        };
+        $ttl = max(0, (int)config('risk.asn_cache_ttl', 3600));
+        if ($ttl === 0) return $lookup()['asn_number'];
+
+        try {
+            $result = Cache::remember('risk:asn:' . hash('sha256', $ip), $ttl, $lookup);
+        } catch (\Throwable $e) {
+            $result = $lookup();
+        }
+        return is_array($result) ? ($result['asn_number'] ?? null) : null;
     }
 }

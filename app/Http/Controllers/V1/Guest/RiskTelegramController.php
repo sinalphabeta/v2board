@@ -18,7 +18,7 @@ class RiskTelegramController extends Controller
         $data = $request->input('message');
         $callback = $request->input('callback_query');
         if (is_array($callback) && !empty($callback['data']) && isset($callback['message']['chat']['id'])) {
-            if (preg_match('/^risk_(list|users|ip|ua):(\\d+)$/', $callback['data'], $match)) {
+            if (preg_match('/^risk_(list|users|ip|ua|asn):(\\d+)$/', $callback['data'], $match)) {
                 $message = (object)[
                     'command' => $match[1] === 'users' ? '/riskusers' : '/list', 'args' => [],
                     'chat_id' => $callback['message']['chat']['id'],
@@ -31,6 +31,7 @@ class RiskTelegramController extends Controller
                     'users' => new \App\Plugins\Telegram\Commands\RiskUsers(),
                     'ip' => new \App\Plugins\Telegram\Commands\ListIp(),
                     'ua' => new \App\Plugins\Telegram\Commands\ListUa(),
+                    'asn' => new \App\Plugins\Telegram\Commands\ListAsn(),
                     'list' => new \App\Plugins\Telegram\Commands\ListCommand()
                 ][$match[1]];
                 $command->handleCallback($message, (string)$callback['id'], (int)$match[2]);
