@@ -30,4 +30,9 @@ return [
         'region' => env('AWS_V2BOARD_REGION', 'us-east-1'),
     ],
 
+    // Chatwoot 网站收件箱 Identity Validation 的密钥，用于生成 identifier_hash
+    'chatwoot' => [
+        'hmac_token' => env('CHATWOOT_HMAC_TOKEN'),
+    ],
+
 ];

@@ -289,6 +289,11 @@ class UserController extends Controller
             abort(500, __('The user does not exist'));
         }
         $user['avatar_url'] = 'https://cravatar.cn/avatar/' . md5($user->email) . '?s=64&d=identicon';
+        // Chatwoot身份验证：以邮箱作为identifier签名，前端setUser时作为identifier_hash提交
+        $chatwootHmacToken = config('services.chatwoot.hmac_token');
+        if ($chatwootHmacToken) {
+            $user['chatwoot_identifier_hash'] = hash_hmac('sha256', $user->email, $chatwootHmacToken);
+        }
         return response([
             'data' => $user
         ]);
