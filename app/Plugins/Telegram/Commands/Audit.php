@@ -48,6 +48,7 @@ class Audit extends RiskCommand
 
     private function actor(RiskAudit $row): string
     {
+        if ($row->actor_type === 'admin') return '管理端 uid ' . $this->markdownCode((int)$row->actor_id);
         if ($row->actor_type === 'bot') return 'Bot uid ' . $this->markdownCode((int)$row->actor_id);
         if ($row->actor_type === 'api') return 'API' . ($row->actor_ip ? ' ' . $this->markdownCode($row->actor_ip) : '');
         if ($row->actor_type === 'system') return '系统';

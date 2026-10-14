@@ -43,11 +43,9 @@ abstract class RiskCommand extends Telegram
         $existing = [];
         $invalid = [];
         foreach ($values as $rawValue) {
-            if ($type === 'email') $value = $service->normalizeEmail($rawValue);
-            elseif ($type === 'asn') $value = $service->normalizeAsn($rawValue) ?: trim((string)$rawValue);
-            else $value = trim((string)$rawValue);
-            if (!$this->validIndicatorValue($type, $value)) {
-                $invalid[] = $value;
+            $value = $service->normalizeIndicatorValue($type, $rawValue);
+            if ($value === null) {
+                $invalid[] = trim((string)$rawValue);
                 continue;
             }
             $indicator = RiskIndicator::where('type', $type)->where('value', $value)->first();
@@ -88,9 +86,7 @@ abstract class RiskCommand extends Telegram
         $deleted = [];
         $missing = [];
         foreach ($values as $rawValue) {
-            if ($type === 'email') $value = $service->normalizeEmail($rawValue);
-            elseif ($type === 'asn') $value = $service->normalizeAsn($rawValue) ?: trim((string)$rawValue);
-            else $value = trim((string)$rawValue);
+            $value = $service->normalizeIndicatorValue($type, $rawValue) ?? trim((string)$rawValue);
             $indicator = RiskIndicator::where('type', $type)->where('value', $value)->where('enabled', 1)->first();
             if (!$indicator) {
                 $missing[] = $value;
@@ -176,18 +172,5 @@ abstract class RiskCommand extends Telegram
     protected function markdownCode($value): string
     {
         return '`' . str_replace(['\\', '`'], ['\\\\', '\\`'], (string)$value) . '`';
-    }
-
-    private function validIndicatorValue(string $type, string $value): bool
-    {
-        if ($value === '' || strlen($value) > 255) return false;
-        if ($type === 'email') return (bool)filter_var($value, FILTER_VALIDATE_EMAIL);
-        if ($type === 'asn') return (new RiskService())->normalizeAsn($value) !== null;
-        if ($type !== 'ip') return true;
-        [$address, $bits] = array_pad(explode('/', $value, 2), 2, null);
-        if (!filter_var($address, FILTER_VALIDATE_IP)) return false;
-        if ($bits === null) return true;
-        $max = filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? 128 : 32;
-        return ctype_digit($bits) && (int)$bits <= $max;
     }
 }

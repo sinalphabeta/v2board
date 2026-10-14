@@ -34,8 +34,8 @@ class RiskService
     }
 
     /**
-     * Who makes the following changes, for the audit log: 'bot' (the admin's user id), 'api' (the caller's IP),
-     * or 'system' (the default, e.g. marking a user at registration).
+     * Who makes the following changes, for the audit log: 'admin' (the admin's user id and IP), 'bot' (the admin's
+     * user id), or 'system' (the default, e.g. marking a user at registration). Older rows may also say 'api'.
      */
     public function actingAs(string $type, ?int $id = null, ?string $ip = null): self
     {
@@ -57,6 +57,42 @@ class RiskService
         if ($number === '0' || strlen($number) > 10) return null;
         if (strlen($number) === 10 && strcmp($number, '4294967295') > 0) return null;
         return 'AS' . $number;
+    }
+
+    /**
+     * The value stored for an indicator of this type, or null if the value is not valid for it.
+     */
+    public function normalizeIndicatorValue(string $type, $value): ?string
+    {
+        $value = trim((string)$value);
+        if ($type === 'email') $value = $this->normalizeEmail($value);
+        if ($type === 'asn') $value = (string)$this->normalizeAsn($value);
+        if ($value === '' || mb_strlen($value, 'UTF-8') > 255) return null;
+        if ($type === 'email') return filter_var($value, FILTER_VALIDATE_EMAIL) ? $value : null;
+        if ($type === 'ip') {
+            [$address, $bits] = array_pad(explode('/', $value, 2), 2, null);
+            if (!filter_var($address, FILTER_VALIDATE_IP)) return null;
+            $max = filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? 128 : 32;
+            return $bits === null || (ctype_digit($bits) && (int)$bits <= $max) ? $value : null;
+        }
+        return in_array($type, ['ua', 'asn'], true) ? $value : null;
+    }
+
+    /**
+     * Users matching a uid, an email, or an IP recorded in their risk events (the newest first).
+     */
+    public function findUsers(string $query, int $limit = 10)
+    {
+        $query = trim($query);
+        if ($query === '') return collect();
+        if (ctype_digit($query)) return User::where('id', (int)$query)->get();
+        if (filter_var($query, FILTER_VALIDATE_IP)) {
+            $ids = RiskEvent::where('ip', $query)->whereNotNull('user_id')->orderByDesc('last_seen_at')
+                ->limit(200)->pluck('user_id')->unique()->take($limit)->values();
+            $users = User::whereIn('id', $ids)->get()->keyBy('id');
+            return $ids->map(function ($id) use ($users) { return $users->get($id); })->filter()->values();
+        }
+        return User::where('email', $this->normalizeEmail($query))->get();
     }
 
     public function clientIp(Request $request): string
@@ -227,9 +263,9 @@ class RiskService
 
     public function addIndicator(string $type, string $value, ?string $note = null): RiskIndicator
     {
-        if ($type === 'email') $value = $this->normalizeEmail($value);
-        elseif ($type === 'asn') $value = (string)$this->normalizeAsn($value);
-        else $value = trim($value);
+        $normalized = $this->normalizeIndicatorValue($type, $value);
+        if ($normalized === null) throw new \InvalidArgumentException("Invalid {$type} indicator: {$value}");
+        $value = $normalized;
         $indicator = RiskIndicator::firstOrNew(['type' => $type, 'value' => $value]);
         // Adding an indicator that is already enabled only changes its note
         $action = $indicator->exists && $indicator->enabled ? 'edit' : 'add';
@@ -264,13 +300,39 @@ class RiskService
         }
     }
 
+    /**
+     * Isolate a user by adding their email to the email indicators; an existing indicator keeps its note.
+     */
+    public function isolateUser(User $user, ?string $note = null): RiskIndicator
+    {
+        $existing = RiskIndicator::where('type', 'email')->where('value', $this->normalizeEmail($user->email))->first();
+        return $this->addIndicator('email', (string)$user->email, $note ?? ($existing ? $existing->note : null));
+    }
+
+    /**
+     * Release a user by disabling the email indicators that match their email. Returns whether they are released.
+     */
+    public function releaseUser(User $user): bool
+    {
+        foreach ($this->enabledEmailIndicators($user->email) as $indicator) $this->removeIndicator($indicator);
+        $user->refresh();
+        // Marked by an indicator that no longer matches the email, e.g. after the email was changed
+        if ((int)$user->risk_status === self::STATUS_RISK) $this->reconcileEmailRisk($user);
+        return (int)$user->risk_status !== self::STATUS_RISK;
+    }
+
+    private function enabledEmailIndicators($email)
+    {
+        return RiskIndicator::where('type', 'email')
+            ->where('enabled', 1)
+            ->whereRaw('LOWER(TRIM(value)) = ?', [$this->normalizeEmail($email)])
+            ->orderBy('id', 'asc')
+            ->get();
+    }
+
     private function reconcileEmailRisk(User $user): void
     {
-        $indicator = RiskIndicator::where('type', 'email')
-            ->where('enabled', 1)
-            ->whereRaw('LOWER(TRIM(value)) = ?', [$this->normalizeEmail($user->email)])
-            ->orderBy('id', 'asc')
-            ->first();
+        $indicator = $this->enabledEmailIndicators($user->email)->first();
         if ($indicator) {
             $user->risk_status = self::STATUS_RISK;
             $user->risk_indicator_id = $indicator->id;
