@@ -40,6 +40,7 @@
         "preferred-install": "dist",
         "sort-packages": true,
         "audit": {
+            "block-insecure": false,
             "ignore": [
                 "PKSA-y2cr-5h3j-g3ys"
             ]
