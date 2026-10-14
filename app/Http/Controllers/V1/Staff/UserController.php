@@ -22,6 +22,8 @@ class UserController extends Controller
             ->where('is_staff', 0)
             ->first();
         if (!$user) abort(500, '用户不存在');
+        // Only admins may see who is isolated: the honeypot works only while it stays secret
+        $user->makeHidden(['risk_status', 'risk_indicator_id', 'risk_marked_at']);
         return response([
             'data' => $user
         ]);
