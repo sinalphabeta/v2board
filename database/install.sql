@@ -601,14 +601,19 @@ CREATE TABLE `v2_risk_indicator` (
 
 CREATE TABLE `v2_risk_audit` (
   `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `actor_type` varchar(16) NOT NULL DEFAULT '',
   `actor_id` int(11) DEFAULT NULL,
+  `actor_ip` varchar(45) DEFAULT NULL,
   `action` varchar(16) NOT NULL,
   `indicator_id` int(11) DEFAULT NULL,
+  `user_id` int(11) DEFAULT NULL,
   `type` varchar(16) NOT NULL,
   `value` varchar(255) NOT NULL,
+  `changes` text,
   `created_at` int(11) NOT NULL,
   PRIMARY KEY (`id`),
-  KEY `risk_audit_created_at` (`created_at`)
+  KEY `risk_audit_created_at` (`created_at`),
+  KEY `risk_audit_user_id` (`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE `v2_risk_event` (

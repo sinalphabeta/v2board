@@ -30,7 +30,7 @@ class RiskController extends Controller
         $note = $request->input('note');
         if ($note !== null && !is_string($note)) abort(422, 'Invalid note');
         if (is_string($note) && strlen($note) > 255) abort(422, 'Note is too long');
-        $indicator = (new RiskService())->addIndicator($type, $value, $note === null ? null : trim($note), null);
+        $indicator = $this->riskService($request)->addIndicator($type, $value, $note === null ? null : trim($note));
         return response(['data' => $indicator], 201);
     }
 
@@ -56,17 +56,14 @@ class RiskController extends Controller
             if ($enabled === null) abort(422, 'Invalid enabled flag');
             $data['enabled'] = $enabled ? 1 : 0;
         }
-        $indicator->fill($data)->save();
-        $riskService = new RiskService();
-        $riskService->refreshEmailIndicator($indicator);
-        $riskService->audit('edit', $indicator, null);
+        $this->riskService($request)->updateIndicator($indicator, $data);
         return response(['data' => $indicator]);
     }
 
-    public function deleteIndicator($id)
+    public function deleteIndicator(Request $request, $id)
     {
         $indicator = RiskIndicator::findOrFail($id);
-        return response(['data' => (new RiskService())->removeIndicator($indicator)]);
+        return response(['data' => $this->riskService($request)->removeIndicator($indicator)]);
     }
 
     public function events(Request $request)
@@ -98,6 +95,12 @@ class RiskController extends Controller
             'mixed_honeypot_nodes' => $mixedNodes,
             'warnings' => $warnings
         ]]);
+    }
+
+    private function riskService(Request $request): RiskService
+    {
+        $riskService = new RiskService();
+        return $riskService->actingAs('api', null, $riskService->clientIp($request));
     }
 
     private function perPage(Request $request): int

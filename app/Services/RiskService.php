@@ -16,6 +16,7 @@ use App\Models\ServerV2node;
 use App\Models\ServerVless;
 use App\Models\ServerVmess;
 use App\Models\User;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 
@@ -25,10 +26,21 @@ class RiskService
     public const STATUS_RISK = 1;
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
     private $ipInfoService;
+    private $actor = ['type' => 'system', 'id' => null, 'ip' => null];
 
     public function __construct(?IpInfoService $ipInfoService = null)
     {
         $this->ipInfoService = $ipInfoService ?: app(IpInfoService::class);
+    }
+
+    /**
+     * Who makes the following changes, for the audit log: 'bot' (the admin's user id), 'api' (the caller's IP),
+     * or 'system' (the default, e.g. marking a user at registration).
+     */
+    public function actingAs(string $type, ?int $id = null, ?string $ip = null): self
+    {
+        $this->actor = ['type' => $type, 'id' => $id, 'ip' => $ip];
+        return $this;
     }
 
     public function normalizeEmail($email): string
@@ -112,7 +124,7 @@ class RiskService
             $user->risk_status = self::STATUS_RISK;
             $user->risk_indicator_id = $emailMatch->id;
             $user->risk_marked_at = time();
-            $user->save();
+            $this->saveUserRisk($user, $emailMatch);
         }
         if ($record && $matches) {
             $this->recordEvent($user, 'identity', $request, $matches);
@@ -213,20 +225,30 @@ class RiskService
         try { SendRiskTelegramJob::dispatch((int)$chatId, $text, $ip); } catch (\Throwable $e) { /* queue unavailable */ }
     }
 
-    public function addIndicator(string $type, string $value, ?string $note = null, ?int $actorId = null): RiskIndicator
+    public function addIndicator(string $type, string $value, ?string $note = null): RiskIndicator
     {
         if ($type === 'email') $value = $this->normalizeEmail($value);
         elseif ($type === 'asn') $value = (string)$this->normalizeAsn($value);
         else $value = trim($value);
-        $indicator = RiskIndicator::updateOrCreate(['type' => $type, 'value' => $value], ['note' => $note, 'enabled' => 1]);
-        Cache::forget(self::INDICATORS_CACHE_KEY);
-        $this->audit('add', $indicator, $actorId);
+        $indicator = RiskIndicator::firstOrNew(['type' => $type, 'value' => $value]);
+        // Adding an indicator that is already enabled only changes its note
+        $action = $indicator->exists && $indicator->enabled ? 'edit' : 'add';
+        $indicator->fill(['note' => $note, 'enabled' => 1]);
+        $this->saveIndicator($indicator, $action);
         if ($type === 'email') {
             User::whereRaw('LOWER(TRIM(email)) = ?', [$value])->get()->each(function ($user) use ($indicator) {
                 $this->reconcileEmailRisk($user);
             });
         }
         return $indicator;
+    }
+
+    public function updateIndicator(RiskIndicator $indicator, array $attributes): bool
+    {
+        $indicator->fill($attributes);
+        $ok = $this->saveIndicator($indicator, 'edit');
+        if ($ok) $this->refreshEmailIndicator($indicator);
+        return $ok;
     }
 
     public function refreshEmailIndicator(RiskIndicator $indicator): void
@@ -253,29 +275,68 @@ class RiskService
             $user->risk_status = self::STATUS_RISK;
             $user->risk_indicator_id = $indicator->id;
             if (!$user->risk_marked_at) $user->risk_marked_at = time();
-            $user->save();
+            $this->saveUserRisk($user, $indicator);
         } elseif ((int)$user->risk_status === self::STATUS_RISK) {
+            $previous = $user->risk_indicator_id ? RiskIndicator::find($user->risk_indicator_id) : null;
             $user->risk_status = self::STATUS_NONE;
             $user->risk_indicator_id = null;
             $user->risk_marked_at = null;
-            $user->save();
+            $this->saveUserRisk($user, $previous);
         }
     }
 
-    public function removeIndicator(RiskIndicator $indicator, ?int $actorId = null): bool
+    public function removeIndicator(RiskIndicator $indicator): bool
     {
         $indicator->enabled = 0;
-        $ok = $indicator->save();
-        if ($ok) {
-            $this->audit('delete', $indicator, $actorId);
-            $this->refreshEmailIndicator($indicator);
-        }
+        $ok = $this->saveIndicator($indicator, 'delete');
+        if ($ok) $this->refreshEmailIndicator($indicator);
         return $ok;
     }
 
-    public function audit(string $action, RiskIndicator $indicator, ?int $actorId): void
+    private function saveIndicator(RiskIndicator $indicator, string $action): bool
     {
-        try { RiskAudit::create(['actor_id' => $actorId, 'action' => $action, 'indicator_id' => $indicator->id, 'type' => $indicator->type, 'value' => $indicator->value, 'created_at' => time()]); } catch (\Throwable $e) { }
+        $changes = $this->changes($indicator, ['value', 'note', 'enabled']);
+        if (!$changes) return true;
+        if (!$indicator->save()) return false;
+        Cache::forget(self::INDICATORS_CACHE_KEY);
+        $this->audit($action, $indicator, $changes);
+        return true;
+    }
+
+    private function saveUserRisk(User $user, ?RiskIndicator $indicator): void
+    {
+        $changes = $this->changes($user, ['risk_status', 'risk_indicator_id']);
+        $user->save();
+        if ($changes) $this->audit($user->risk_status ? 'mark' : 'unmark', $indicator, $changes, $user);
+    }
+
+    /**
+     * The fields of an unsaved model that will change, as [field => [old, new]].
+     */
+    private function changes(Model $model, array $fields): array
+    {
+        $changes = [];
+        foreach ($fields as $field) {
+            if (!$model->isDirty($field)) continue;
+            $old = $model->getOriginal($field);
+            $new = $model->getAttribute($field);
+            if ($old !== $new) $changes[$field] = [$old, $new];
+        }
+        return $changes;
+    }
+
+    private function audit(string $action, ?RiskIndicator $indicator, array $changes, ?User $user = null): void
+    {
+        try {
+            RiskAudit::create([
+                'actor_type' => $this->actor['type'], 'actor_id' => $this->actor['id'], 'actor_ip' => $this->actor['ip'],
+                'action' => $action, 'indicator_id' => $indicator ? $indicator->id : null, 'user_id' => $user ? $user->id : null,
+                // Users are only marked through email indicators
+                'type' => $indicator ? $indicator->type : 'email',
+                'value' => $indicator ? $indicator->value : $this->normalizeEmail($user ? $user->email : ''),
+                'changes' => $changes, 'created_at' => time()
+            ]);
+        } catch (\Throwable $e) { }
     }
 
     public function cleanup(int $days = 90): int

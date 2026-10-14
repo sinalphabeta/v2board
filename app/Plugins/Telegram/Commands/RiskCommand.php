@@ -37,7 +37,7 @@ abstract class RiskCommand extends Telegram
         if (!$this->authorized($message)) return;
         if (empty($message->args[0])) { $this->sendMarkdownReply($message, '用法: `' . $this->command . ' value`'); return; }
 
-        $service = new RiskService();
+        $service = (new RiskService())->actingAs('bot', $this->actorId);
         $values = $type === 'ua' ? [implode(' ', $message->args)] : $message->args;
         $added = [];
         $existing = [];
@@ -55,7 +55,7 @@ abstract class RiskCommand extends Telegram
                 $existing[] = $value;
                 continue;
             }
-            $service->addIndicator($type, $value, null, $this->actorId);
+            $service->addIndicator($type, $value);
             $added[] = $value;
         }
         $text = '*操作完成*';
@@ -83,7 +83,7 @@ abstract class RiskCommand extends Telegram
         if (!$this->authorized($message)) return;
         if (empty($message->args[0])) { $this->sendMarkdownReply($message, '用法: `' . $this->command . ' value`'); return; }
 
-        $service = new RiskService();
+        $service = (new RiskService())->actingAs('bot', $this->actorId);
         $values = $type === 'ua' ? [implode(' ', $message->args)] : $message->args;
         $deleted = [];
         $missing = [];
@@ -96,7 +96,7 @@ abstract class RiskCommand extends Telegram
                 $missing[] = $value;
                 continue;
             }
-            if ($service->removeIndicator($indicator, $this->actorId)) $deleted[] = $value;
+            if ($service->removeIndicator($indicator)) $deleted[] = $value;
         }
         $text = '*操作完成*';
         if ($deleted) $text .= "\n\n✅ 删除 " . count($deleted) . " 条:\n" . $this->bulletList($deleted);

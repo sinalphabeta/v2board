@@ -918,3 +918,13 @@ ALTER TABLE `v2_risk_indicator`
 
 ALTER TABLE `v2_risk_audit`
   ADD KEY `risk_audit_created_at` (`created_at`);
+
+ALTER TABLE `v2_risk_audit`
+  ADD `actor_type` varchar(16) NOT NULL DEFAULT '' AFTER `id`,
+  ADD `actor_ip` varchar(45) DEFAULT NULL AFTER `actor_id`,
+  ADD `user_id` int(11) DEFAULT NULL AFTER `indicator_id`,
+  ADD `changes` text AFTER `value`,
+  ADD KEY `risk_audit_user_id` (`user_id`);
+
+UPDATE `v2_risk_audit` SET `actor_type` = IF(`actor_id` IS NULL, 'api', 'bot')
+  WHERE `actor_type` = '';
