@@ -116,7 +116,7 @@ abstract class RiskCommand extends Telegram
             $time = date('m-d H:i:s', (int)$event->last_seen_at);
             $ua = preg_replace('/\s+/', ' ', (string)$event->user_agent);
             return $this->markdownCode($time) . ' \\| ' . $this->markdownCode($event->ip) . ' \\| ' .
-                $this->markdownCode(substr($ua, 0, 96)) . " \\| x" . (int)$event->occurrences;
+                $this->markdownCode(mb_substr($ua, 0, 96, 'UTF-8')) . " \\| x" . (int)$event->occurrences;
         })->implode("\n");
     }
 

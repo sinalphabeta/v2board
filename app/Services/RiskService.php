@@ -135,8 +135,7 @@ class RiskService
     public function recordEvent(?User $user, string $eventType, ?Request $request, array $matches = []): void
     {
         $ip = $request ? $this->clientIp($request) : '0.0.0.0';
-        $ua = $request ? preg_replace('/[\x00-\x1F\x7F]+/', ' ', (string)$request->header('User-Agent', '')) : '';
-        $ua = substr((string)$ua, 0, 512);
+        $ua = $request ? $this->cleanUserAgent($request->header('User-Agent', ''), 512) : '';
         $ruleIds = array_map(function ($m) { return (string)$m->id; }, $matches);
         sort($ruleIds);
         $target = $user ? 'user:' . $user->id : 'target:global';
@@ -190,7 +189,7 @@ class RiskService
 
     public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = []): void
     {
-        $ua = substr((string)preg_replace('/[\x00-\x1F\x7F]+/', ' ', $ua), 0, 240);
+        $ua = $this->cleanUserAgent($ua, 240);
         $chatId = config('risk.alert_chat_id', '');
         if (!$chatId) return;
         $plan = $user && $user->plan_id ? Plan::find($user->plan_id) : null;
@@ -336,6 +335,16 @@ class RiskService
         if ($bytes && substr($ipBin, 0, $bytes) !== substr($networkBin, 0, $bytes)) return false;
         if ($rem) { $mask = chr((0xff << (8 - $rem)) & 0xff); if ((ord($ipBin[$bytes]) & ord($mask)) !== (ord($networkBin[$bytes]) & ord($mask))) return false; }
         return true;
+    }
+
+    /**
+     * Replace invalid UTF-8 and control characters, then cut by characters: a cut by bytes can split a multibyte
+     * character, which MySQL (strict mode) and Telegram reject.
+     */
+    private function cleanUserAgent($ua, int $length): string
+    {
+        $ua = preg_replace('/[\x00-\x1F\x7F]+/', ' ', mb_scrub((string)$ua, 'UTF-8'));
+        return mb_substr((string)$ua, 0, $length, 'UTF-8');
     }
 
     private function ipMatchesAny(string $ip, array $rules): bool
