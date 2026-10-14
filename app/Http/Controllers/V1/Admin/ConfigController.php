@@ -72,7 +72,7 @@ class ConfigController extends Controller
         $hookUrl = secure_url('/api/v1/guest/risk/telegram/webhook');
         $telegramService = new TelegramService($token);
         $telegramService->getMe();
-        $telegramService->setWebhook($hookUrl, hash('sha256', $token));
+        $telegramService->setWebhook($hookUrl, hash('sha256', $token), true);
         return response(['data' => true]);
     }
 

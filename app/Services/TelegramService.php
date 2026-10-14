@@ -3,6 +3,7 @@ namespace App\Services;
 
 use App\Jobs\SendTelegramJob;
 use App\Models\User;
+use App\Plugins\Telegram\Commands\RiskCommand;
 use \Curl\Curl;
 use Illuminate\Mail\Markdown;
 
@@ -74,16 +75,16 @@ class TelegramService {
         return $this->request('getMe');
     }
 
-    public function setWebhook(string $url, string $secretToken = '')
+    public function setWebhook(string $url, string $secretToken = '', bool $riskBot = false)
     {
-        $commands = $this->discoverCommands(base_path('app/Plugins/Telegram/Commands'));
+        $commands = $this->discoverCommands(base_path('app/Plugins/Telegram/Commands'), $riskBot);
         $this->setMyCommands($commands);
         $params = ['url' => $url];
         if ($secretToken !== '') $params['secret_token'] = $secretToken;
         return $this->request('setWebhook', $params);
     }
 
-    public function discoverCommands(string $directory): array
+    public function discoverCommands(string $directory, bool $riskBot = false): array
     {
         $commands = [];
 
@@ -95,6 +96,11 @@ class TelegramService {
             }
 
             if (!class_exists($className)) {
+                continue;
+            }
+
+            // The risk bot's commands share this directory with the main bot's: each bot lists only its own
+            if (is_subclass_of($className, RiskCommand::class) !== $riskBot) {
                 continue;
             }
 
