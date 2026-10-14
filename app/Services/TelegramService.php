@@ -3,7 +3,6 @@ namespace App\Services;
 
 use App\Jobs\SendTelegramJob;
 use App\Models\User;
-use App\Plugins\Telegram\Commands\RiskCommand;
 use \Curl\Curl;
 use Illuminate\Mail\Markdown;
 
@@ -33,7 +32,10 @@ class TelegramService {
         return $this->request('sendMessage', $params);
     }
 
-    public function editMessageText(int $chatId, int $messageId, string $text, string $parseMode = '', array $replyMarkup = [])
+    /**
+     * $entities formats the text instead of $parseMode, e.g. to keep a message's formatting when appending to it.
+     */
+    public function editMessageText(int $chatId, int $messageId, string $text, string $parseMode = '', array $replyMarkup = [], ?array $entities = null)
     {
         if ($parseMode === 'markdown') $text = str_replace('_', '\\_', $text);
         $params = [
@@ -43,7 +45,17 @@ class TelegramService {
             'parse_mode' => $parseMode
         ];
         if ($replyMarkup) $params['reply_markup'] = json_encode($replyMarkup, JSON_UNESCAPED_UNICODE);
+        if ($entities !== null) $params['entities'] = json_encode($entities, JSON_UNESCAPED_UNICODE);
         return $this->request('editMessageText', $params);
+    }
+
+    public function editMessageReplyMarkup(int $chatId, int $messageId, array $replyMarkup)
+    {
+        return $this->request('editMessageReplyMarkup', [
+            'chat_id' => $chatId,
+            'message_id' => $messageId,
+            'reply_markup' => json_encode($replyMarkup, JSON_UNESCAPED_UNICODE)
+        ]);
     }
 
     public function answerCallbackQuery(string $callbackQueryId, string $text = '')
@@ -75,16 +87,19 @@ class TelegramService {
         return $this->request('getMe');
     }
 
-    public function setWebhook(string $url, string $secretToken = '', bool $riskBot = false)
+    /**
+     * $commands replaces the commands discovered in app/Plugins/Telegram/Commands (the main bot's).
+     */
+    public function setWebhook(string $url, string $secretToken = '', ?array $commands = null)
     {
-        $commands = $this->discoverCommands(base_path('app/Plugins/Telegram/Commands'), $riskBot);
+        $commands = $commands ?? $this->discoverCommands(base_path('app/Plugins/Telegram/Commands'));
         $this->setMyCommands($commands);
         $params = ['url' => $url];
         if ($secretToken !== '') $params['secret_token'] = $secretToken;
         return $this->request('setWebhook', $params);
     }
 
-    public function discoverCommands(string $directory, bool $riskBot = false): array
+    public function discoverCommands(string $directory): array
     {
         $commands = [];
 
@@ -96,11 +111,6 @@ class TelegramService {
             }
 
             if (!class_exists($className)) {
-                continue;
-            }
-
-            // The risk bot's commands share this directory with the main bot's: each bot lists only its own
-            if (is_subclass_of($className, RiskCommand::class) !== $riskBot) {
                 continue;
             }
 

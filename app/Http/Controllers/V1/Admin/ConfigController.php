@@ -5,6 +5,7 @@ namespace App\Http\Controllers\V1\Admin;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Admin\ConfigSave;
 use App\Jobs\SendEmailJob;
+use App\Plugins\RiskTelegram\RiskBot;
 use App\Services\TelegramService;
 use App\Utils\Dict;
 use Illuminate\Http\Request;
@@ -72,7 +73,7 @@ class ConfigController extends Controller
         $hookUrl = secure_url('/api/v1/guest/risk/telegram/webhook');
         $telegramService = new TelegramService($token);
         $telegramService->getMe();
-        $telegramService->setWebhook($hookUrl, hash('sha256', $token), true);
+        $telegramService->setWebhook($hookUrl, hash('sha256', $token), RiskBot::commandList());
         return response(['data' => true]);
     }
 

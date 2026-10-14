@@ -2,6 +2,9 @@
 
 namespace App\Jobs;
 
+use App\Models\RiskEvent;
+use App\Models\User;
+use App\Plugins\RiskTelegram\RiskView;
 use App\Services\IpInfoService;
 use App\Services\TelegramService;
 use Illuminate\Bus\Queueable;
@@ -17,16 +20,21 @@ class SendRiskTelegramJob implements ShouldQueue
     protected $telegramId;
     protected $text;
     protected $ip;
+    // The user and event the alert is about, for its buttons (jobs queued by older code have neither)
+    protected $userId;
+    protected $eventId;
 
     public $tries = 3;
     public $timeout = 10;
 
-    public function __construct(int $telegramId, string $text, ?string $ip = null)
+    public function __construct(int $telegramId, string $text, ?string $ip = null, ?int $userId = null, ?int $eventId = null)
     {
         $this->onQueue('send_telegram');
         $this->telegramId = $telegramId;
         $this->text = $text;
         $this->ip = $ip;
+        $this->userId = $userId;
+        $this->eventId = $eventId;
     }
 
     public function handle(IpInfoService $ipInfoService)
@@ -46,7 +54,11 @@ class SendRiskTelegramJob implements ShouldQueue
                 $text = substr_replace($text, $ipLine . $infoLines, $position, strlen($ipLine));
             }
         }
-        (new TelegramService($token))->sendMessage($this->telegramId, $text, 'MarkdownV2');
+        // Buttons follow the user's state when the alert is sent, e.g. 解除隔离 for an isolated user
+        $user = $this->userId ? User::find($this->userId) : null;
+        $event = $user && $this->eventId ? RiskEvent::find($this->eventId) : null;
+        $keyboard = $user ? ['inline_keyboard' => (new RiskView())->alertKeyboard($user, $event)] : [];
+        app()->makeWith(TelegramService::class, ['token' => $token])->sendMessage($this->telegramId, $text, 'MarkdownV2', $keyboard);
     }
 
     private function markdownCode($value): string

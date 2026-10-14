@@ -221,7 +221,7 @@ class RiskService
                 $event->occurrences = max(1, (int)$event->occurrences + max(1, $count - $lastSyncedCount));
                 $event->save();
             } else {
-                RiskEvent::create([
+                $event = RiskEvent::create([
                     'fingerprint' => $fingerprint, 'user_id' => $user ? $user->id : null,
                     'event_type' => $eventType, 'ip' => $ip, 'user_agent' => $ua,
                     'indicator_ids' => json_encode($ruleIds), 'first_seen_at' => $now,
@@ -232,10 +232,13 @@ class RiskService
         } catch (\Throwable $e) {
             return;
         }
-        if ($count === 1) $this->notify($user, $eventType, $ip, $ua, $matches);
+        if ($count === 1) $this->notify($user, $eventType, $ip, $ua, $matches, (int)$event->id);
     }
 
-    public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = []): void
+    /**
+     * Send a risk alert to the alert chat; with a user and an event it carries the risk bot's action buttons.
+     */
+    public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = [], ?int $eventId = null): void
     {
         $ua = $this->cleanUserAgent($ua, 240);
         $chatId = config('risk.alert_chat_id', '');
@@ -258,7 +261,9 @@ class RiskService
             "\nrules: " . $code($rules);
         $token = (string)config('risk.bot_token', '');
         if (!$token) return;
-        try { SendRiskTelegramJob::dispatch((int)$chatId, $text, $ip); } catch (\Throwable $e) { /* queue unavailable */ }
+        try {
+            SendRiskTelegramJob::dispatch((int)$chatId, $text, $ip, $user ? (int)$user->id : null, $eventId);
+        } catch (\Throwable $e) { /* queue unavailable */ }
     }
 
     public function addIndicator(string $type, string $value, ?string $note = null): RiskIndicator
