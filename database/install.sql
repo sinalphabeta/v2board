@@ -268,7 +268,7 @@ CREATE TABLE `v2_server_hysteria` (
                                       `name` varchar(255) NOT NULL,
                                       `parent_id` int(11) DEFAULT NULL,
                                       `host` varchar(255) NOT NULL,
-                                      `port` varchar(11) NOT NULL,
+                                      `port` varchar(255) NOT NULL,
                                       `server_port` int(11) NOT NULL,
                                       `tags` varchar(255) DEFAULT NULL,
                                       `rate` varchar(11) NOT NULL,
@@ -607,7 +607,8 @@ CREATE TABLE `v2_risk_audit` (
   `type` varchar(16) NOT NULL,
   `value` varchar(255) NOT NULL,
   `created_at` int(11) NOT NULL,
-  PRIMARY KEY (`id`)
+  PRIMARY KEY (`id`),
+  KEY `risk_audit_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE `v2_risk_event` (

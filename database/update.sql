@@ -915,3 +915,6 @@ DELETE r1 FROM `v2_risk_indicator` r1
 
 ALTER TABLE `v2_risk_indicator`
   ADD UNIQUE KEY `risk_indicator_type_value` (`type`,`value`);
+
+ALTER TABLE `v2_risk_audit`
+  ADD KEY `risk_audit_created_at` (`created_at`);
