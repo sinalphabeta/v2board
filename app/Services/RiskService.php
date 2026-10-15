@@ -98,7 +98,7 @@ class RiskService
     public function clientIp(Request $request): string
     {
         $remote = (string)$request->server('REMOTE_ADDR', '');
-        $trusted = config('risk.trusted_proxies', '');
+        $trusted = RiskSettings::get('trusted_proxies');
         if (!is_array($trusted)) $trusted = array_filter(array_map('trim', explode(',', (string)$trusted)));
         if ($remote && $this->ipMatchesAny($remote, $trusted)) {
             foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR'] as $header) {
@@ -241,7 +241,7 @@ class RiskService
     public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = [], ?int $eventId = null): void
     {
         $ua = $this->cleanUserAgent($ua, 240);
-        $chatId = config('risk.alert_chat_id', '');
+        $chatId = RiskSettings::get('alert_chat_id');
         if (!$chatId) return;
         $plan = $user && $user->plan_id ? Plan::find($user->plan_id) : null;
         $rules = is_array($matches)
@@ -259,7 +259,7 @@ class RiskService
             "\nemail: " . $code($user ? $user->email : '-') . "\nip: " . $code($ip) . "\nua: " . $code($ua) .
             "\nplan: " . $code($plan ? $plan->name : '-') . "\ngroup: " . $code($user ? $user->group_id : '-') .
             "\nrules: " . $code($rules);
-        $token = (string)config('risk.bot_token', '');
+        $token = (string)RiskSettings::get('bot_token');
         if (!$token) return;
         try {
             SendRiskTelegramJob::dispatch((int)$chatId, $text, $ip, $user ? (int)$user->id : null, $eventId);
@@ -406,6 +406,25 @@ class RiskService
         } catch (\Throwable $e) { }
     }
 
+    /**
+     * Audit a changed risk setting. The bot token and the alert chat ID are only recorded as set (with their last
+     * 4 characters) or empty, never in full.
+     */
+    public function auditSetting(string $name, $old, $new): void
+    {
+        $mask = function ($value) use ($name) {
+            if (!in_array($name, ['bot_token', 'alert_chat_id'], true) || $value === '' || $value === null) return $value;
+            return '已设置（…' . mb_substr((string)$value, -4, null, 'UTF-8') . '）';
+        };
+        try {
+            RiskAudit::create([
+                'actor_type' => $this->actor['type'], 'actor_id' => $this->actor['id'], 'actor_ip' => $this->actor['ip'],
+                'action' => 'setting', 'type' => 'setting', 'value' => $name,
+                'changes' => ['value' => [$mask($old), $mask($new)]], 'created_at' => time()
+            ]);
+        } catch (\Throwable $e) { }
+    }
+
     public function cleanup(int $days = 90): int
     {
         try { return RiskEvent::where('last_seen_at', '<', time() - $days * 86400)->delete(); } catch (\Throwable $e) { return 0; }
@@ -416,7 +435,7 @@ class RiskService
      */
     public function mixedHoneypotNodes(): array
     {
-        $honeypot = (int)config('risk.honeypot_group_id', 0);
+        $honeypot = (int)RiskSettings::get('honeypot_group_id');
         if ($honeypot <= 0) return [];
 
         $models = [
@@ -489,7 +508,7 @@ class RiskService
             $result = $this->ipInfoService->lookupAsn($ip);
             return ['asn_number' => $this->normalizeAsn($result['asn_number'] ?? null)];
         };
-        $ttl = max(0, (int)config('risk.asn_cache_ttl', 3600));
+        $ttl = max(0, (int)RiskSettings::get('asn_cache_ttl'));
         if ($ttl === 0) return $lookup()['asn_number'];
 
         try {

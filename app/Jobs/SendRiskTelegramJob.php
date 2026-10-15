@@ -6,6 +6,7 @@ use App\Models\RiskEvent;
 use App\Models\User;
 use App\Plugins\RiskTelegram\RiskView;
 use App\Services\IpInfoService;
+use App\Services\RiskSettings;
 use App\Services\TelegramService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -39,10 +40,10 @@ class SendRiskTelegramJob implements ShouldQueue
 
     public function handle(IpInfoService $ipInfoService)
     {
-        $token = (string)config('risk.bot_token', '');
+        $token = (string)RiskSettings::get('bot_token');
         if (!$token) return;
         $text = $this->text;
-        if (config('risk.ip_info_enabled', true) && filter_var($this->ip, FILTER_VALIDATE_IP)) {
+        if (RiskSettings::get('ip_info_enabled') && filter_var($this->ip, FILTER_VALIDATE_IP)) {
             $ipLine = "\nip: " . $this->markdownCode($this->ip);
             $position = strpos($text, $ipLine);
             if ($position !== false) {

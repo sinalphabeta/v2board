@@ -10,6 +10,7 @@ use App\Models\ServerGroup;
 use App\Models\User;
 use App\Services\IpInfoService;
 use App\Services\RiskService;
+use App\Services\RiskSettings;
 
 /**
  * The risk bot's messages (MarkdownV2) and inline keyboards. A view is ['text' => string, 'keyboard' => rows of buttons].
@@ -25,7 +26,12 @@ class RiskView
 {
     public const TYPES = ['email' => '邮箱', 'ip' => 'IP', 'ua' => 'UA', 'asn' => 'ASN'];
     private const EVENT_TYPES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'identity' => '命中'];
-    private const ACTIONS = ['add' => '新增', 'edit' => '编辑', 'delete' => '删除', 'mark' => '隔离用户', 'unmark' => '解除隔离'];
+    private const ACTIONS = ['add' => '新增', 'edit' => '编辑', 'delete' => '删除', 'mark' => '隔离用户', 'unmark' => '解除隔离', 'setting' => '修改设置'];
+    // Settings edited on the admin panel (RiskSettings)
+    public const SETTINGS = [
+        'bot_token' => 'Bot Token', 'alert_chat_id' => '告警群 Chat ID', 'honeypot_group_id' => '蜜罐权限组',
+        'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
+    ];
     private const FIELDS = ['value' => '值', 'note' => '备注', 'enabled' => '启用'];
     // Audit changes that the action itself already says
     private const IMPLIED = ['add' => ['value', 'enabled'], 'delete' => ['enabled']];
@@ -101,14 +107,14 @@ class RiskView
     public function health(): array
     {
         $risk = new RiskService();
-        $honeypot = (int)config('risk.honeypot_group_id', 0);
+        $honeypot = (int)RiskSettings::get('honeypot_group_id');
         $group = $honeypot > 0 ? ServerGroup::find($honeypot) : null;
         $counts = RiskIndicator::where('enabled', 1)->selectRaw('type, COUNT(*) AS total')->groupBy('type')->pluck('total', 'type');
         $asnAvailable = (new IpInfoService())->asnDatabaseAvailable();
         $lines = [
             '🩺 *风控状态*',
             '蜜罐权限组：' . ($honeypot > 0 ? $this->code($honeypot) . ($group ? ' ' . $this->escape($group->name) : ' ⚠️ 不存在') : '未配置'),
-            '告警群：' . (config('risk.alert_chat_id') ? '已配置' : '未配置'),
+            '告警群：' . (RiskSettings::get('alert_chat_id') ? '已配置' : '未配置'),
             '启用的名单：' . collect(self::TYPES)->map(function ($label, $type) use ($counts) {
                 return $label . ' ' . (int)($counts[$type] ?? 0);
             })->implode(' · '),
@@ -263,7 +269,9 @@ class RiskView
     {
         $parts = [$this->code($this->time($row->created_at, 'm-d H:i:s')), $this->escape(self::ACTIONS[$row->action] ?? $row->action)];
         if ($row->user_id) $parts[] = 'uid ' . $this->code((int)$row->user_id);
-        $parts[] = $this->escape($row->type) . ' ' . $this->code($this->shorten($row->value, 60));
+        $parts[] = $row->action === 'setting'
+            ? $this->escape('设置 ' . (self::SETTINGS[$row->value] ?? $row->value))
+            : $this->escape($row->type) . ' ' . $this->code($this->shorten($row->value, 60));
         $parts[] = $this->actor($row);
         $line = implode(' \\| ', $parts);
         $changes = [];
@@ -348,7 +356,7 @@ class RiskView
     private function changeValue(string $field, $value): string
     {
         if ($value === null || $value === '') return '空';
-        if ($field === 'enabled') return $value ? '是' : '否';
+        if ($field === 'enabled' || is_bool($value)) return $value ? '是' : '否';
         return $this->code($this->shorten($value, 60));
     }
 

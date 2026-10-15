@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Admin\ConfigSave;
 use App\Jobs\SendEmailJob;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Services\RiskSettings;
 use App\Services\TelegramService;
 use App\Utils\Dict;
 use Illuminate\Http\Request;
@@ -68,8 +69,9 @@ class ConfigController extends Controller
 
     public function setRiskTelegramWebhook(Request $request)
     {
-        $token = (string)config('risk.bot_token', '');
-        if (!$token) abort(422, 'Risk bot token is required');
+        // Usually clicked right after saving the token
+        $token = (string)RiskSettings::fresh()['bot_token'];
+        if (!$token) abort(422, '请先在风控概览保存风险 Bot Token');
         $hookUrl = secure_url('/api/v1/guest/risk/telegram/webhook');
         $telegramService = new TelegramService($token);
         $telegramService->getMe();

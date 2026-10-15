@@ -928,3 +928,10 @@ ALTER TABLE `v2_risk_audit`
 
 UPDATE `v2_risk_audit` SET `actor_type` = IF(`actor_id` IS NULL, 'api', 'bot')
   WHERE `actor_type` = '';
+
+CREATE TABLE IF NOT EXISTS `v2_risk_setting` (
+  `name` varchar(64) NOT NULL,
+  `value` text,
+  `updated_at` int(11) NOT NULL,
+  PRIMARY KEY (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

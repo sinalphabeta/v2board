@@ -7,6 +7,7 @@ use App\Models\RiskIndicator;
 use App\Models\User;
 use App\Plugins\RiskTelegram\Commands\RiskCommand;
 use App\Services\RiskService;
+use App\Services\RiskSettings;
 use App\Services\TelegramService;
 
 /**
@@ -21,7 +22,7 @@ class RiskBot
 
     public function __construct()
     {
-        $token = (string)config('risk.bot_token', '');
+        $token = (string)RiskSettings::get('bot_token');
         $this->telegram = app()->makeWith(TelegramService::class, ['token' => $token]);
         $this->view = new RiskView();
         $this->botId = (int)explode(':', $token)[0];
@@ -270,7 +271,7 @@ class RiskBot
 
     private function authorize($message): ?User
     {
-        $alertChatId = (string)config('risk.alert_chat_id', '');
+        $alertChatId = (string)RiskSettings::get('alert_chat_id');
         if (!$message->is_private && (!$alertChatId || (string)$message->chat_id !== $alertChatId)) {
             $this->reply($message, '请私聊风险 Bot 执行此命令');
             return null;
