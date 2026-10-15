@@ -58,12 +58,17 @@ class TelegramService {
         ]);
     }
 
-    public function answerCallbackQuery(string $callbackQueryId, string $text = '')
+    /**
+     * $showAlert shows the text in a dialog to close, instead of a notice that goes away by itself.
+     */
+    public function answerCallbackQuery(string $callbackQueryId, string $text = '', bool $showAlert = false)
     {
-        return $this->request('answerCallbackQuery', [
+        $params = [
             'callback_query_id' => $callbackQueryId,
             'text' => $text
-        ]);
+        ];
+        if ($showAlert) $params['show_alert'] = 'true';
+        return $this->request('answerCallbackQuery', $params);
     }
 
     public function approveChatJoinRequest(int $chatId, int $userId)

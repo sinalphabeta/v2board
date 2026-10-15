@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Exceptions\RiskIpAllowlistedException;
 use App\Jobs\SendRiskTelegramJob;
 use App\Models\Plan;
 use App\Models\RiskAudit;
@@ -24,6 +25,16 @@ class RiskService
 {
     public const STATUS_NONE = 0;
     public const STATUS_RISK = 1;
+    /**
+     * Indicator types. allow_ip is an allowlist: requests from its IPs skip the IP and ASN rules. The others are
+     * risk rules (RULE_TYPES): a match is recorded and alerted, and an email match also isolates the user.
+     */
+    public const TYPES = ['email' => '邮箱', 'ip' => 'IP', 'ua' => 'UA', 'asn' => 'ASN', 'allow_ip' => 'IP 白名单'];
+    public const LIST_NAMES = ['email' => '邮箱名单', 'ip' => 'IP 名单', 'ua' => 'UA 名单', 'asn' => 'ASN 名单', 'allow_ip' => 'IP 白名单'];
+    public const RULE_TYPES = ['email', 'ip', 'ua', 'asn'];
+    // The shortest allowlist prefix by address length: at most a /16 (IPv4) or /48 (IPv6) is let through at once
+    private const ALLOW_MIN_PREFIX = [32 => 16, 128 => 48];
+    public const ALLOW_IP_FORMAT = 'IP 白名单只接受 IP，或不大于 /16（IPv6 /48）的网段，也不能是 0.0.0.0 或 ::';
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
     private $ipInfoService;
     private $actor = ['type' => 'system', 'id' => null, 'ip' => null];
@@ -69,13 +80,88 @@ class RiskService
         if ($type === 'asn') $value = (string)$this->normalizeAsn($value);
         if ($value === '' || mb_strlen($value, 'UTF-8') > 255) return null;
         if ($type === 'email') return filter_var($value, FILTER_VALIDATE_EMAIL) ? $value : null;
-        if ($type === 'ip') {
-            [$address, $bits] = array_pad(explode('/', $value, 2), 2, null);
-            if (!filter_var($address, FILTER_VALIDATE_IP)) return null;
-            $max = filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? 128 : 32;
-            return $bits === null || (ctype_digit($bits) && (int)$bits <= $max) ? $value : null;
-        }
+        if ($type === 'ip' || $type === 'allow_ip') return $this->normalizeIpRange($value, $type === 'allow_ip');
         return in_array($type, ['ua', 'asn'], true) ? $value : null;
+    }
+
+    /**
+     * An IP or CIDR in its standard form, e.g. 2001:DB8:0::1 → 2001:db8::1, 1.2.3.4/32 → 1.2.3.4 and
+     * 1.2.3.4/24 → 1.2.3.0/24, or null if it is not one. For the allowlist also null for 0.0.0.0, :: and the ranges
+     * containing them (0.0.0.0 is recorded when the client IP is unknown), and for ranges larger than ALLOW_MIN_PREFIX.
+     */
+    private function normalizeIpRange(string $value, bool $allowlist): ?string
+    {
+        $range = $this->parseIpRange($value);
+        if ($range === null) return null;
+        [$binary, $bits, $max] = $range;
+        // Clear the host bits
+        $bytes = intdiv($bits, 8);
+        $network = substr($binary, 0, $bytes);
+        if ($bits % 8) $network .= chr(ord($binary[$bytes]) & (0xff << (8 - $bits % 8)) & 0xff);
+        $network = str_pad($network, strlen($binary), "\0");
+        if ($allowlist && ($bits < self::ALLOW_MIN_PREFIX[$max] || trim($network, "\0") === '')) return null;
+        $address = inet_ntop($network);
+        return $bits === $max ? $address : "{$address}/{$bits}";
+    }
+
+    /**
+     * [address in binary, prefix length, address length in bits] of an IP (as a /32 or /128) or a CIDR, or null.
+     */
+    private function parseIpRange(string $value): ?array
+    {
+        [$address, $bits] = array_pad(explode('/', trim($value), 2), 2, null);
+        if (!filter_var($address, FILTER_VALIDATE_IP)) return null;
+        $binary = inet_pton($address);
+        $max = strlen($binary) * 8;
+        if ($bits === null) return [$binary, $max, $max];
+        if (!ctype_digit($bits) || (int)$bits > $max) return null;
+        return [$binary, (int)$bits, $max];
+    }
+
+    /**
+     * Whether the IP or CIDR $inner lies entirely within $outer: the same IP version, a prefix at least as long, and
+     * its address within $outer (so a CIDR with host bits set, like 1.2.3.4/24, counts as its network).
+     */
+    public function ipRangeWithin(string $inner, string $outer): bool
+    {
+        $innerRange = $this->parseIpRange($inner);
+        $outerRange = $this->parseIpRange($outer);
+        if ($innerRange === null || $outerRange === null || $innerRange[2] !== $outerRange[2]) return false;
+        return $innerRange[1] >= $outerRange[1] && $this->ipMatches(inet_ntop($innerRange[0]), trim($outer));
+    }
+
+    /**
+     * The enabled IP allowlist entry that covers this IP or CIDR, read from the database (not the indicator cache).
+     */
+    public function allowEntryFor(string $ipOrCidr): ?RiskIndicator
+    {
+        return RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->orderBy('id')->get()
+            ->first(function (RiskIndicator $entry) use ($ipOrCidr) {
+                return $this->ipRangeWithin($ipOrCidr, $entry->value);
+            });
+    }
+
+    /**
+     * What allowlisting an event's IP adds: the IP, or for IPv6 its /64 since clients rotate their IPv6 addresses.
+     * Null for a private or reserved IP.
+     */
+    public function allowRangeFor(string $ip): ?string
+    {
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return null;
+        return $this->normalizeIndicatorValue('allow_ip', filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? "{$ip}/64" : $ip);
+    }
+
+    /**
+     * How many users each of these IPs had in the last 30 days of risk events, as [ip => count]; IPs without any are
+     * left out. Only risk events are recorded, so for an IP that hits the IP or ASN rules these are all its users.
+     */
+    public function recentUserCounts(array $ips): array
+    {
+        $ips = array_values(array_unique(array_filter($ips, 'strlen')));
+        if (!$ips) return [];
+        return RiskEvent::whereIn('ip', $ips)->whereNotNull('user_id')->where('last_seen_at', '>=', time() - 30 * 86400)
+            ->selectRaw('ip, COUNT(DISTINCT user_id) AS users')->groupBy('ip')->pluck('users', 'ip')
+            ->map(function ($users) { return (int)$users; })->all();
     }
 
     /**
@@ -131,9 +217,17 @@ class RiskService
         }
         $email = $this->normalizeEmail($email);
         $ua = strtolower($ua);
+        // An allowlisted IP skips the IP and ASN rules, so its ASN is not looked up either
+        $allowed = false;
+        foreach ($indicators as $indicator) {
+            if ($indicator->type === 'allow_ip' && $this->ipMatches($ip, trim((string)$indicator->value))) {
+                $allowed = true;
+                break;
+            }
+        }
         $asn = null;
         foreach ($indicators as $indicator) {
-            if ($indicator->type === 'asn') {
+            if ($indicator->type === 'asn' && !$allowed) {
                 $asn = $this->lookupAsn($ip);
                 break;
             }
@@ -145,7 +239,7 @@ class RiskService
             $matched = false;
             if ($indicator->type === 'email') $matched = $email !== '' && $email === $this->normalizeEmail($value);
             if ($indicator->type === 'ua') $matched = $ua !== '' && strpos($ua, strtolower($value)) !== false;
-            if ($indicator->type === 'ip') $matched = $this->ipMatches($ip, $value);
+            if ($indicator->type === 'ip') $matched = !$allowed && $this->ipMatches($ip, $value);
             if ($indicator->type === 'asn') $matched = $asn !== null && $asn === $this->normalizeAsn($value);
             if ($matched) $matches[] = $indicator;
         }
@@ -266,7 +360,42 @@ class RiskService
         } catch (\Throwable $e) { /* queue unavailable */ }
     }
 
-    public function addIndicator(string $type, string $value, ?string $note = null): RiskIndicator
+    /**
+     * Add indicators of a type, as the admin panel and the risk bot do. Returns the values grouped as added, existing
+     * (already enabled), invalid, allowlisted (IP indicators an allowlist entry covers, not added) and disabled (IP
+     * indicators that the added allowlist entries cover). A disabled indicator added again keeps its note unless
+     * $note is given.
+     */
+    public function addIndicators(string $type, array $values, ?string $note = null): array
+    {
+        $result = ['added' => [], 'existing' => [], 'invalid' => [], 'allowlisted' => [], 'disabled' => []];
+        foreach ($values as $rawValue) {
+            $value = $this->normalizeIndicatorValue($type, $rawValue);
+            if ($value === null) {
+                $result['invalid'][] = trim((string)$rawValue);
+                continue;
+            }
+            $indicator = RiskIndicator::where('type', $type)->where('value', $value)->first();
+            if ($indicator && $indicator->enabled) {
+                $result['existing'][] = $value;
+                continue;
+            }
+            try {
+                $this->addIndicator($type, $value, $note ?? ($indicator ? $indicator->note : null), $disabled);
+            } catch (RiskIpAllowlistedException $e) {
+                $result['allowlisted'][] = $value;
+                continue;
+            }
+            $result['added'][] = $value;
+            $result['disabled'] = array_merge($result['disabled'], $disabled);
+        }
+        return $result;
+    }
+
+    /**
+     * Add an indicator or enable it again; see saveIndicatorChecked() for how it is kept apart from the allowlist.
+     */
+    public function addIndicator(string $type, string $value, ?string $note = null, ?array &$disabled = null): RiskIndicator
     {
         $normalized = $this->normalizeIndicatorValue($type, $value);
         if ($normalized === null) throw new \InvalidArgumentException("Invalid {$type} indicator: {$value}");
@@ -275,7 +404,7 @@ class RiskService
         // Adding an indicator that is already enabled only changes its note
         $action = $indicator->exists && $indicator->enabled ? 'edit' : 'add';
         $indicator->fill(['note' => $note, 'enabled' => 1]);
-        $this->saveIndicator($indicator, $action);
+        $this->saveIndicatorChecked($indicator, $action, $disabled);
         if ($type === 'email') {
             User::whereRaw('LOWER(TRIM(email)) = ?', [$value])->get()->each(function ($user) use ($indicator) {
                 $this->reconcileEmailRisk($user);
@@ -284,10 +413,10 @@ class RiskService
         return $indicator;
     }
 
-    public function updateIndicator(RiskIndicator $indicator, array $attributes): bool
+    public function updateIndicator(RiskIndicator $indicator, array $attributes, ?array &$disabled = null): bool
     {
         $indicator->fill($attributes);
-        $ok = $this->saveIndicator($indicator, 'edit');
+        $ok = $this->saveIndicatorChecked($indicator, 'edit', $disabled);
         if ($ok) $this->refreshEmailIndicator($indicator);
         return $ok;
     }
@@ -360,12 +489,49 @@ class RiskService
         return $ok;
     }
 
-    private function saveIndicator(RiskIndicator $indicator, string $action): bool
+    /**
+     * Save an indicator, keeping the IP list and the allowlist apart when it is added, enabled again or given a new
+     * value (a new note alone changes nothing): an IP indicator that an enabled allowlist entry covers is refused
+     * with RiskIpAllowlistedException, and an allowlist entry disables the IP indicators it covers, whose values go
+     * to $disabled. IP ranges larger than an allowlist entry stay: the entry lets its part of them through.
+     */
+    private function saveIndicatorChecked(RiskIndicator $indicator, string $action, ?array &$disabled): bool
+    {
+        $disabled = [];
+        $takesEffect = $indicator->enabled && (!$indicator->exists || $indicator->isDirty(['value', 'enabled']));
+        if ($takesEffect && $indicator->type === 'ip') {
+            $entry = $this->allowEntryFor($indicator->value);
+            if ($entry) throw new RiskIpAllowlistedException($indicator->value, $entry);
+        }
+        if (!$this->saveIndicator($indicator, $action)) return false;
+        if ($takesEffect && $indicator->type === 'allow_ip') $disabled = $this->disableIpsCoveredBy($indicator);
+        return true;
+    }
+
+    /**
+     * Disable the enabled IP indicators that the allowlist entry covers. Returns their values.
+     */
+    private function disableIpsCoveredBy(RiskIndicator $entry): array
+    {
+        $disabled = [];
+        foreach (RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->get() as $indicator) {
+            if (!$this->ipRangeWithin($indicator->value, $entry->value)) continue;
+            $indicator->enabled = 0;
+            if ($this->saveIndicator($indicator, 'delete', "被 IP 白名单 {$entry->value} 覆盖")) $disabled[] = $indicator->value;
+        }
+        return $disabled;
+    }
+
+    /**
+     * $reason: why the system made the change, audited with it, e.g. an IP indicator disabled by an allowlist entry.
+     */
+    private function saveIndicator(RiskIndicator $indicator, string $action, ?string $reason = null): bool
     {
         $changes = $this->changes($indicator, ['value', 'note', 'enabled']);
         if (!$changes) return true;
         if (!$indicator->save()) return false;
         Cache::forget(self::INDICATORS_CACHE_KEY);
+        if ($reason !== null) $changes['reason'] = $reason;
         $this->audit($action, $indicator, $changes);
         return true;
     }

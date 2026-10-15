@@ -2,6 +2,7 @@
 
 namespace App\Plugins\RiskTelegram;
 
+use App\Exceptions\RiskIpAllowlistedException;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\User;
@@ -85,6 +86,8 @@ class RiskBot
             'text' => (string)($message['text'] ?? ''),
             'entities' => is_array($message['entities'] ?? null) ? $message['entities'] : [],
             'by' => $this->displayName($callback['from']),
+            // Set by an action whose notice must be read before going on: shown in a dialog instead
+            'alert' => false,
         ];
         try {
             $notice = $this->runCallback((string)($callback['data'] ?? ''), $context, $admin);
@@ -92,7 +95,8 @@ class RiskBot
             report($e);
             $notice = '处理失败，请检查服务日志';
         }
-        $this->telegram->answerCallbackQuery($id, $notice);
+        // Telegram takes at most 200 characters
+        $this->telegram->answerCallbackQuery($id, mb_substr($notice, 0, 200, 'UTF-8'), $context->alert);
     }
 
     /**
@@ -124,24 +128,13 @@ class RiskBot
      */
     public function addIndicators($message, User $admin, string $type, array $values): void
     {
-        $service = (new RiskService())->actingAs('bot', $admin->id);
-        $added = $existing = $invalid = [];
-        foreach ($values as $rawValue) {
-            $value = $service->normalizeIndicatorValue($type, $rawValue);
-            if ($value === null) {
-                $invalid[] = trim((string)$rawValue);
-                continue;
-            }
-            $indicator = RiskIndicator::where('type', $type)->where('value', $value)->first();
-            if ($indicator && $indicator->enabled) {
-                $existing[] = $value;
-                continue;
-            }
-            $service->addIndicator($type, $value);
-            $added[] = $value;
-        }
-        $notes = $type === 'email' && $added ? $this->usersLine('🔒 已隔离', $added, true) : [];
-        $this->reply($message, $this->view->result(['✅ 新增' => $added, '⚠️ 已存在' => $existing, '❌ 格式无效' => $invalid], $notes), true);
+        $result = (new RiskService())->actingAs('bot', $admin->id)->addIndicators($type, $values);
+        $notes = $type === 'email' && $result['added'] ? $this->usersLine('🔒 已隔离', $result['added'], true) : [];
+        if ($type === 'allow_ip' && $result['invalid']) $notes[] = $this->view->escape(RiskService::ALLOW_IP_FORMAT);
+        $this->reply($message, $this->view->result([
+            '✅ 新增' => $result['added'], '⚠️ 已存在' => $result['existing'], '❌ 格式无效' => $result['invalid'],
+            '🟢 在 IP 白名单里，没有加入' => $result['allowlisted'], '🌐 已从 IP 名单移除' => $result['disabled'],
+        ], $notes), true);
     }
 
     /**
@@ -153,7 +146,9 @@ class RiskBot
         $deleted = $missing = [];
         foreach ($values as $rawValue) {
             $value = $service->normalizeIndicatorValue($type, $rawValue) ?? trim((string)$rawValue);
-            $indicator = RiskIndicator::where('type', $type)->where('value', $value)->where('enabled', 1)->first();
+            // Also as typed: IPs added before they were stored in their standard form
+            $indicator = RiskIndicator::where('type', $type)->whereIn('value', array_unique([$value, trim((string)$rawValue)]))
+                ->where('enabled', 1)->first();
             if (!$indicator) {
                 $missing[] = $value;
                 continue;
@@ -182,7 +177,7 @@ class RiskBot
             case 'a': $this->edit($context, $this->view->audit($int(2))); return '';
             case 'h': $this->edit($context, $this->view->health()); return '';
         }
-        if (in_array($verb, ['p', 'P', 'k'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $admin);
+        if (in_array($verb, ['p', 'P', 'k', 'w', 'W'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $admin);
         if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x'], true)) return '';
 
         $card = in_array($verb, ['c', 'cr', 'ue'], true);
@@ -239,7 +234,7 @@ class RiskBot
     }
 
     /**
-     * Buttons of an alert about one event: list its IP, or mark the alert handled.
+     * Buttons of an alert about one event: list its IP, allowlist it, or mark the alert handled.
      */
     private function eventAction(string $verb, ?RiskEvent $event, $context, User $admin): string
     {
@@ -253,14 +248,47 @@ class RiskBot
             return $this->askToConfirm($context, "确认把 {$event->ip} 加入 IP 名单", "r:P:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
         }
         $service = (new RiskService())->actingAs('bot', $admin->id);
+        if ($verb === 'w' || $verb === 'W') return $this->allowEventIp($verb === 'W', $event, $user, $context, $service);
         $ip = $service->normalizeIndicatorValue('ip', $event->ip);
         if ($ip === null) return 'IP 无效';
         $indicator = RiskIndicator::where('type', 'ip')->where('value', $ip)->first();
         if ($indicator && $indicator->enabled) return '这个 IP 已在名单里';
-        $service->addIndicator('ip', $ip, $user ? "来自告警（uid {$user->id}）" : '来自告警');
+        try {
+            $service->addIndicator('ip', $ip, $user ? "来自告警（uid {$user->id}）" : '来自告警');
+        } catch (RiskIpAllowlistedException $e) {
+            if ($user) $this->editKeyboard($context, $this->view->alertKeyboard($user, $event));
+            return "这个 IP 在 IP 白名单 {$e->entry->value} 里，不能加入 IP 名单";
+        }
         $this->appendLine($context, "🌐 {$ip} 已加入 IP 名单 · {$context->by} · " . date('m-d H:i'),
             $user ? $this->view->alertKeyboard($user, $event) : []);
         return '已加入 IP 名单';
+    }
+
+    /**
+     * 放行此 IP on an alert: first ask, saying what it does and how many users the IP had (many suggest a CDN or proxy
+     * address), then add it to the allowlist, an IPv6 address as its /64.
+     */
+    private function allowEventIp(bool $confirmed, RiskEvent $event, ?User $user, $context, RiskService $service): string
+    {
+        $ip = (string)$event->ip;
+        $range = $service->allowRangeFor($ip);
+        if ($range === null) return '内网、保留地址不能加入 IP 白名单';
+        $entry = $service->allowEntryFor($ip);
+        if ($entry) {
+            if ($user) $this->editKeyboard($context, $this->view->alertKeyboard($user, $event));
+            return "这个 IP 已在 IP 白名单 {$entry->value} 里";
+        }
+        if (!$confirmed) {
+            $users = $service->recentUserCounts([$ip])[$ip] ?? 0;
+            $this->askToConfirm($context, "确认放行 {$range}", "r:W:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
+            $context->alert = true;
+            return '放行 ' . $range . ($range !== $ip ? '（这个 IPv6 地址所在的 /64）' : '') .
+                "：之后它命中 IP、ASN 名单不再告警，UA、邮箱名单照常。\n最近 30 天的风险事件里有 {$users} 个用户用过这个 IP，人数多时可能是 CDN 或代理的地址。";
+        }
+        $service->addIndicator('allow_ip', $range, $user ? "来自告警（uid {$user->id}）" : '来自告警', $disabled);
+        $line = "🟢 {$range} 已加入 IP 白名单" . ($disabled ? '，停用了 IP 名单 ' . implode('、', $disabled) : '');
+        $this->appendLine($context, "{$line} · {$context->by} · " . date('m-d H:i'), $user ? $this->view->alertKeyboard($user, $event) : []);
+        return '已加入 IP 白名单';
     }
 
     private function askToConfirm($context, string $label, string $confirm, string $cancel): string

@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\V1\Admin;
 
+use App\Exceptions\RiskIpAllowlistedException;
 use App\Http\Controllers\Controller;
 use App\Models\Plan;
 use App\Models\RiskAudit;
@@ -21,7 +22,6 @@ use Illuminate\Http\Request;
  */
 class RiskController extends Controller
 {
-    private const TYPES = ['email', 'ip', 'ua', 'asn'];
     private const ACTIONS = ['add', 'edit', 'delete', 'mark', 'unmark', 'setting'];
 
     public function overview()
@@ -40,7 +40,7 @@ class RiskController extends Controller
         if ($mixed) $warnings[] = '这些节点同时属于蜜罐组和普通组：' . implode('、', $mixed);
         if (($counts['asn'] ?? 0) && !$asnAvailable) $warnings[] = '有 ASN 名单，但 ASN 数据库不可用';
         $indicators = [];
-        foreach (self::TYPES as $type) $indicators[$type] = (int)($counts[$type] ?? 0);
+        foreach (array_keys(RiskService::TYPES) as $type) $indicators[$type] = (int)($counts[$type] ?? 0);
         return response(['data' => [
             'isolated_users' => User::where('risk_status', RiskService::STATUS_RISK)->count(),
             'indicators' => $indicators,
@@ -113,7 +113,7 @@ class RiskController extends Controller
         $query = RiskIndicator::query();
         $type = $request->input('type');
         if ($type !== null) {
-            if (!in_array($type, self::TYPES, true)) abort(500, '名单类型有误');
+            if (!$this->validType($type)) abort(500, '名单类型有误');
             $query->where('type', $type);
         }
         $enabled = $request->input('enabled');
@@ -129,6 +129,8 @@ class RiskController extends Controller
 
     /**
      * With an id: change the indicator's value and note. Without: add indicators of a type, one or more per line.
+     * Both return the IP indicators that allowlist entries disabled (`disabled`); adding also groups the values,
+     * see RiskService::addIndicators().
      */
     public function indicatorSave(Request $request)
     {
@@ -138,42 +140,31 @@ class RiskController extends Controller
             $indicator = RiskIndicator::find((int)$request->input('id'));
             if (!$indicator) abort(500, '名单不存在');
             $value = $service->normalizeIndicatorValue($indicator->type, $request->input('value', $indicator->value));
-            if ($value === null) abort(500, '值的格式有误');
+            if ($value === null) abort(500, $indicator->type === 'allow_ip' ? RiskService::ALLOW_IP_FORMAT : '值的格式有误');
             if (RiskIndicator::where('type', $indicator->type)->where('value', $value)->where('id', '!=', $indicator->id)->exists()) {
                 abort(500, '名单里已经有这个值');
             }
-            $service->updateIndicator($indicator, ['value' => $value, 'note' => $note]);
-            return response(['data' => true]);
+            try {
+                $service->updateIndicator($indicator, ['value' => $value, 'note' => $note], $disabled);
+            } catch (RiskIpAllowlistedException $e) {
+                abort(500, "{$e->value} 在 IP 白名单 {$e->entry->value} 里，不能加入 IP 名单");
+            }
+            return response(['data' => ['disabled' => $disabled]]);
         }
 
         $type = $request->input('type');
-        if (!in_array($type, self::TYPES, true)) abort(500, '名单类型有误');
+        if (!$this->validType($type)) abort(500, '名单类型有误');
         // A UA keyword may contain spaces and commas, so UAs go one per line; other values may also be separated by them
         $lines = preg_split('/\R/u', (string)$request->input('values', ''));
         if ($type !== 'ua') $lines = preg_split('/[\s,，]+/u', implode("\n", $lines));
         $values = array_values(array_unique(array_filter(array_map('trim', $lines), 'strlen')));
         if (!$values) abort(500, '请输入要添加的值');
-        $added = $existing = $invalid = [];
-        foreach ($values as $rawValue) {
-            $value = $service->normalizeIndicatorValue($type, $rawValue);
-            if ($value === null) {
-                $invalid[] = $rawValue;
-                continue;
-            }
-            $indicator = RiskIndicator::where('type', $type)->where('value', $value)->first();
-            if ($indicator && $indicator->enabled) {
-                $existing[] = $value;
-                continue;
-            }
-            // Re-adding a disabled indicator keeps its note unless a new one is given
-            $service->addIndicator($type, $value, $note ?? ($indicator ? $indicator->note : null));
-            $added[] = $value;
-        }
-        return response(['data' => ['added' => $added, 'existing' => $existing, 'invalid' => $invalid]]);
+        return response(['data' => $service->addIndicators($type, $values, $note)]);
     }
 
     /**
-     * Enable or disable an indicator (disabling an email indicator releases its users).
+     * Enable or disable an indicator (disabling an email indicator releases its users). Returns the IP indicators
+     * that an enabled allowlist entry disabled (`disabled`).
      */
     public function indicatorUpdate(Request $request)
     {
@@ -182,9 +173,17 @@ class RiskController extends Controller
         $enabled = (string)$request->input('enabled');
         if (!in_array($enabled, ['0', '1'], true)) abort(500, '参数错误');
         $service = $this->riskService($request);
-        if ($enabled === '1') $service->updateIndicator($indicator, ['enabled' => 1]);
-        else $service->removeIndicator($indicator);
-        return response(['data' => true]);
+        $disabled = [];
+        if ($enabled === '1') {
+            try {
+                $service->updateIndicator($indicator, ['enabled' => 1], $disabled);
+            } catch (RiskIpAllowlistedException $e) {
+                abort(500, "{$e->value} 在 IP 白名单 {$e->entry->value} 里，不能启用");
+            }
+        } else {
+            $service->removeIndicator($indicator);
+        }
+        return response(['data' => ['disabled' => $disabled]]);
     }
 
     public function userFetch(Request $request)
@@ -249,7 +248,10 @@ class RiskController extends Controller
                 ->get(['id', 'email', 'risk_status'])->keyBy('id');
             $ruleIds = $events->flatMap(function (RiskEvent $event) { return $this->ruleIds($event); })->unique()->values();
             $rules = RiskIndicator::whereIn('id', $ruleIds)->get(['id', 'type', 'value'])->keyBy('id');
-            return $events->map(function (RiskEvent $event) use ($users, $rules) {
+            $service = new RiskService();
+            $allowlist = RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->pluck('value');
+            $userCounts = $service->recentUserCounts($events->pluck('ip')->all());
+            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $userCounts) {
                 $user = $users->get($event->user_id);
                 return [
                     'id' => $event->id,
@@ -258,6 +260,14 @@ class RiskController extends Controller
                     'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
                     'event_type' => $event->event_type,
                     'ip' => $event->ip,
+                    // Whether an enabled allowlist entry covers the IP now (the event may be from before)
+                    'ip_allowed' => $allowlist->contains(function ($entry) use ($service, $event) {
+                        return $service->ipMatches((string)$event->ip, $entry);
+                    }),
+                    // What 放行此 IP adds to the allowlist (an IPv6 address as its /64), null for a private or reserved IP
+                    'ip_allow_value' => $service->allowRangeFor((string)$event->ip),
+                    // Users of the IP in the last 30 days of risk events: many suggest a CDN or proxy address
+                    'ip_users_30d' => $userCounts[$event->ip] ?? 0,
                     'user_agent' => $event->user_agent,
                     'occurrences' => (int)$event->occurrences,
                     'first_seen_at' => $event->first_seen_at,
@@ -302,6 +312,11 @@ class RiskController extends Controller
         $total = (clone $query)->count();
         $rows = $query->forPage($current, $pageSize)->get();
         return response(['data' => $map ? $map($rows) : $rows, 'total' => $total]);
+    }
+
+    private function validType($type): bool
+    {
+        return in_array($type, array_keys(RiskService::TYPES), true);
     }
 
     private function riskService(Request $request): RiskService

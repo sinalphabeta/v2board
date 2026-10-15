@@ -33,6 +33,9 @@ class Edit extends RiskCommand
             $bot->reply($message, '未找到：' . $view->code($target), true);
             return;
         }
+        // An allowlisted IP is often also a disabled IP indicator: then the enabled one is meant
+        $enabled = $indicators->filter(function (RiskIndicator $indicator) { return $indicator->enabled; });
+        if ($indicators->count() > 1 && $enabled->count() === 1) $indicators = $enabled;
         if ($indicators->count() > 1) {
             $bot->reply($message, "这个值在多份名单里，请用 ID：\n" . $indicators->map(function (RiskIndicator $indicator) use ($view) {
                 return '• ID ' . $view->code($indicator->id) . ' · ' . RiskView::TYPES[$indicator->type] . ' ' . $view->code($indicator->value) .
