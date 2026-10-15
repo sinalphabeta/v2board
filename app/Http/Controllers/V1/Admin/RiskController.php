@@ -108,6 +108,9 @@ class RiskController extends Controller
         return response(['data' => true]);
     }
 
+    /**
+     * IP indicators and the allowlist also say where their IPs are (a CIDR by its network address), see ipInfoFields().
+     */
     public function indicatorFetch(Request $request)
     {
         $query = RiskIndicator::query();
@@ -124,7 +127,18 @@ class RiskController extends Controller
                 $query->where('value', 'like', $keyword)->orWhere('note', 'like', $keyword);
             });
         }
-        return $this->paged($request, $query->orderByDesc('id'));
+        return $this->paged($request, $query->orderByDesc('id'), function ($indicators) {
+            $ips = $indicators->filter(function (RiskIndicator $indicator) {
+                return in_array($indicator->type, ['ip', 'allow_ip'], true);
+            })->mapWithKeys(function (RiskIndicator $indicator) {
+                return [$indicator->id => explode('/', (string)$indicator->value)[0]];
+            });
+            $info = $ips->isEmpty() ? [] : (new IpInfoService())->lookupMany($ips->values()->all());
+            return $indicators->map(function (RiskIndicator $indicator) use ($ips, $info) {
+                $row = $indicator->toArray();
+                return isset($ips[$indicator->id]) ? $row + $this->ipInfoFields($info[$ips[$indicator->id]] ?? null) : $row;
+            })->values();
+        });
     }
 
     /**
@@ -251,7 +265,8 @@ class RiskController extends Controller
             $service = new RiskService();
             $allowlist = RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->pluck('value');
             $userCounts = $service->recentUserCounts($events->pluck('ip')->all());
-            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $userCounts) {
+            $info = (new IpInfoService())->lookupMany($events->pluck('ip')->all());
+            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $userCounts, $info) {
                 $user = $users->get($event->user_id);
                 return [
                     'id' => $event->id,
@@ -276,7 +291,7 @@ class RiskController extends Controller
                         $rule = $rules->get($id);
                         return $rule ? "{$rule->type}:{$rule->value}" : "#{$id}";
                     }, $this->ruleIds($event)),
-                ];
+                ] + $this->ipInfoFields($info[$event->ip] ?? null);
             })->values();
         });
     }
@@ -312,6 +327,20 @@ class RiskController extends Controller
         $total = (clone $query)->count();
         $rows = $query->forPage($current, $pageSize)->get();
         return response(['data' => $map ? $map($rows) : $rows, 'total' => $total]);
+    }
+
+    /**
+     * Where an IP is, shown under it in the lists: ip_location (国家 省 市, or 内网/保留地址), ip_network (the ISP or
+     * IDC), ip_asn (AS37963) and ip_asn_name, null when unknown. Only shown, never matched against.
+     */
+    private function ipInfoFields(?array $info): array
+    {
+        return [
+            'ip_location' => $info['location'] ?? null,
+            'ip_network' => $info['network'] ?? null,
+            'ip_asn' => $info['asn_number'] ?? null,
+            'ip_asn_name' => $info['asn_name'] ?? null,
+        ];
     }
 
     private function validType($type): bool
