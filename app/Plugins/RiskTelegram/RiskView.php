@@ -21,6 +21,7 @@ use App\Services\RiskSettings;
  *   r:m  menu · r:u:<page> isolated users · r:e:<page> recent events · r:l:<type>:<page> indicators
  *   r:a:<page> audit log · r:h status · r:c:<uid> user card · r:cr:<uid> user card as a new reply
  *   r:ue:<uid>:<s|l|o>:<page> a user's subscriptions, logins or orders (the access log)
+ *   r:n:<ip> the users of an IP, as a new reply (the IP's colons as dashes: the data is split at colons)
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
  *   r:t:<ctx>:<uid>:<eid> ask to let the user's subscriptions through today, r:T:… do it
  *   r:p:<eid> ask to list the event's IP, r:P:<eid> do it · r:k:<eid> mark the alert handled
@@ -39,6 +40,7 @@ class RiskView
         'bot_token' => 'Bot Token', 'alert_chat_id' => '告警群 Chat ID', 'honeypot_group_id' => '蜜罐权限组',
         'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
         'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
+        'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
@@ -150,6 +152,7 @@ class RiskView
             $this->time($lastError['at'] ?? null, 'm-d H:i')) . ' ' . $this->code($this->shorten($lastError['message'] ?? '', 80)) : '');
         $lines[] = '订阅上限：' . $this->escape($stats['daily_limit'] ? $stats['daily_limit'] . ' 次/天，超过返回 429' : '不限');
         $lines[] = '节点出口 IP：' . $stats['nodes'] . $this->escape(' 个（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）');
+        $lines[] = '关联检测：' . (RiskSettings::get('link_detection') ? '开 · 同 IP ' . (int)RiskSettings::get('link_ip_users') . ' 人起报' : '关');
         $mixed = $risk->mixedHoneypotNodes();
         if ($mixed) $lines[] = "\n⚠️ 这些节点同时属于蜜罐组和普通组：" . $this->escape(implode(', ', $mixed));
         if ($honeypot > 0 && !$group) $lines[] = "\n⚠️ 蜜罐权限组不存在：被隔离的用户拿不到任何节点";
@@ -280,7 +283,7 @@ class RiskView
     /**
      * Buttons under an alert about a user. A public IP that is not allowlisted can be added to the IP list (unless it
      * is listed already) or allowlisted, on its own row so as not to be taken for the other. Alerts of what a check
-     * found (RiskService::FINDING_TYPES) also offer what fits them: 今天放行.
+     * found (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行.
      */
     public function alertKeyboard(User $user, ?RiskEvent $event): array
     {
@@ -293,6 +296,9 @@ class RiskView
         ]];
         if ($event) {
             $finding = [];
+            if (in_array($event->event_type, ['ip_users', 'register_link'], true) && filter_var($event->ip, FILTER_VALIDATE_IP)) {
+                $finding[] = $this->button('🔎 这个 IP 的用户', 'r:n:' . str_replace(':', '-', (string)$event->ip));
+            }
             if ($event->event_type === 'sub_limit' && $this->limitedToday($user)) {
                 $finding[] = $this->button('✅ 今天放行', "r:t:a:{$user->id}:{$eventId}");
             }

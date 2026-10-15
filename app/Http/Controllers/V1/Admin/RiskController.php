@@ -105,7 +105,7 @@ class RiskController extends Controller
             if ($invalid) abort(500, '可信代理里这些不是 IP 或 CIDR：' . implode('、', $invalid));
             $values['trusted_proxies'] = implode(',', array_unique($proxies));
         }
-        foreach (['access_log_enabled'] as $name) {
+        foreach (['access_log_enabled', 'link_detection'] as $name) {
             if (!$request->has($name)) continue;
             $enabled = (string)$request->input($name);
             if (!in_array($enabled, ['0', '1'], true)) abort(500, '参数错误');
@@ -114,6 +114,7 @@ class RiskController extends Controller
         $ranges = [
             'access_log_days' => [7, 365, '访问记录保留天数应该是 7 到 365 之间的整数'],
             'sub_daily_limit' => [0, 100000, '每天订阅上限应该是 0 到 100000 之间的整数，0 表示不限'],
+            'link_ip_users' => [2, 50, '同 IP 多用户阈值应该是 2 到 50 之间的整数'],
         ];
         foreach ($ranges as $name => [$min, $max, $error]) {
             if (!$request->has($name)) continue;

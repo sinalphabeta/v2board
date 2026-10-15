@@ -41,6 +41,7 @@ class Kernel extends ConsoleKernel
         $schedule->command('reset:log')->daily();
         $schedule->command('risk:cleanup')->dailyAt('00:20');
         $schedule->command('risk:summary')->dailyAt('23:55');
+        $schedule->command('risk:scan')->everyTenMinutes()->withoutOverlapping();
         $schedule->command('risk:geoip-update')->dailyAt('03:30')->withoutOverlapping();
         // send
         $schedule->command('send:remindMail')->dailyAt('11:30');

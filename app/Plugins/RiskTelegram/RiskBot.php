@@ -176,6 +176,7 @@ class RiskBot
             case 'l': $this->edit($context, $this->view->indicators((string)($parts[2] ?? ''), $int(3))); return '';
             case 'a': $this->edit($context, $this->view->audit($int(2))); return '';
             case 'h': $this->edit($context, $this->view->health()); return '';
+            case 'n': return $this->ipUsers(str_replace('-', ':', (string)($parts[2] ?? '')), $context);
         }
         if (in_array($verb, ['p', 'P', 'k', 'w', 'W'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $admin);
         if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x', 't', 'T'], true)) return '';
@@ -188,6 +189,18 @@ class RiskBot
         if ($verb === 'ue') $this->edit($context, $this->view->userEvents($user, (string)($parts[3] ?? 's'), $int(4)));
         if ($card) return '';
         return $this->userAction($verb, (string)($parts[2] ?? ''), $user, RiskEvent::find($int(4)), $context, $admin);
+    }
+
+    /**
+     * The users of an IP (an IPv6 address by its /64), sent as a reply to the alert or report it was asked from.
+     */
+    private function ipUsers(string $ip, $context): string
+    {
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) return 'IP 无效';
+        $risk = new RiskService();
+        $usage = $risk->ipUsage([$ip], $risk->searchDays())[$ip] ?? [];
+        $this->send($context->chat_id, $this->view->searchResults($risk->findUsers($ip, 20), $ip, $usage), $context->message_id);
+        return '';
     }
 
     /**
@@ -288,7 +301,7 @@ class RiskBot
             $this->askToConfirm($context, "确认放行 {$range}", "r:W:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
             $context->alert = true;
             return '放行 ' . $range . ($range !== $ip ? '（这个 IPv6 地址所在的 /64）' : '') .
-                "：之后它命中 IP、ASN 名单不再告警，UA、邮箱名单照常。\n最近 30 天有 {$users} 个用户用过这个 IP，" .
+                "：之后它命中 IP、ASN 名单不再告警，关联检测也跳过它；UA、邮箱名单照常。\n最近 30 天有 {$users} 个用户用过这个 IP，" .
                 '人数多时可能是 CDN、代理或公司、学校的出口。';
         }
         $service->addIndicator('allow_ip', $range, $user ? "来自告警（uid {$user->id}）" : '来自告警', $disabled);

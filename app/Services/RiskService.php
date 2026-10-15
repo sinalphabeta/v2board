@@ -30,7 +30,7 @@ class RiskService
      * Risk events that are not a matched request but something a check found (recordFinding()), with what it found in
      * the event's detail.
      */
-    public const FINDING_TYPES = ['sub_limit' => '订阅超限'];
+    public const FINDING_TYPES = ['sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联'];
     // Alerts of each finding type a day; the rest are only recorded as risk events
     public const ALERT_BUDGET = 20;
     /**
@@ -46,6 +46,7 @@ class RiskService
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
     private $ipInfoService;
     private $access;
+    private $links;
     private $actor = ['type' => 'system', 'id' => null, 'ip' => null];
 
     public function __construct(?IpInfoService $ipInfoService = null)
@@ -57,6 +58,12 @@ class RiskService
     {
         if (!$this->access) $this->access = new RiskAccessService($this);
         return $this->access;
+    }
+
+    public function links(): RiskLinkService
+    {
+        if (!$this->links) $this->links = new RiskLinkService($this);
+        return $this->links;
     }
 
     /**
@@ -326,6 +333,7 @@ class RiskService
     /**
      * Check a request against the indicators (an email match isolates the user if $allowMark) and record it: as a
      * risk event when it matches or the user is isolated, and in the access log as $result, unless that is null.
+     * A registration is also checked for links to other accounts (RiskLinkService).
      */
     public function observe(User $user, string $eventType, Request $request, bool $allowMark = false, ?string $result = 'ok', int $count = 0): array
     {
@@ -339,6 +347,7 @@ class RiskService
         if ($result !== null) {
             if ($eventType === 'register' && (int)$user->risk_status === self::STATUS_RISK) $result = 'isolated';
             $this->access()->record($user, $eventType, $request, $result, $count);
+            if ($eventType === 'register') $this->links()->checkRegistration($user, $request);
         }
         return $matches;
     }

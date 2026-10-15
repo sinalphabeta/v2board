@@ -11,7 +11,7 @@ use Illuminate\Support\Facades\DB;
 /**
  * The access log (v2_risk_access): every login, registration, subscription and order, one row per day (record_at, the
  * day's 0:00), user, type, result, IP and user agent, kept for access_log_days days. Also the daily subscription limit,
- * and the exit IPs of the nodes.
+ * and the exit IPs of the nodes, which the link checks leave out.
  *
  * An IPv6 address is merged by its /64 (ip_net), since clients rotate their addresses; ip keeps the last one seen.
  * Rows are written one statement each, outside any transaction; a write never fails the request: errors are reported at
