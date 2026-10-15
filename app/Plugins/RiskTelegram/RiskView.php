@@ -19,11 +19,11 @@ use App\Services\RiskSettings;
  *
  * Button callback data, at most 64 bytes:
  *   r:m  menu · r:u:<page> isolated users · r:e:<page> recent events · r:l:<type>:<page> indicators
- *   r:a:<page> audit log · r:h status · r:c:<uid> user card · r:cr:<uid> user card as a new reply
+ *   r:a:<page> audit log · r:h status · r:d today's report · r:c:<uid> user card · r:cr:<uid> user card as a new reply
  *   r:ue:<uid>:<s|l|o>:<page> a user's subscriptions, logins or orders (the access log)
  *   r:n:<ip> the users of an IP, as a new reply (the IP's colons as dashes: the data is split at colons)
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
- *   r:t:<ctx>:<uid>:<eid> ask to let the user's subscriptions through today, r:T:… do it
+ *   r:s|t:<ctx>:<uid>:<eid> ask to reset the subscription / let it through today, r:S|T:… do it
  *   r:p:<eid> ask to list the event's IP, r:P:<eid> do it · r:k:<eid> mark the alert handled
  *   r:w:<eid> ask to allowlist the event's IP, r:W:<eid> do it
  */
@@ -33,14 +33,14 @@ class RiskView
     private const EVENT_TYPES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'identity' => '命中'] + RiskService::FINDING_TYPES;
     private const ACTIONS = [
         'add' => '新增', 'edit' => '编辑', 'delete' => '删除', 'mark' => '隔离用户', 'unmark' => '解除隔离', 'setting' => '修改设置',
-        'exempt' => '今天放行',
+        'reset' => '重置订阅', 'exempt' => '今天放行',
     ];
     // Settings edited on the admin panel (RiskSettings)
     public const SETTINGS = [
         'bot_token' => 'Bot Token', 'alert_chat_id' => '告警群 Chat ID', 'honeypot_group_id' => '蜜罐权限组',
         'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
         'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
-        'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值',
+        'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
@@ -61,7 +61,7 @@ class RiskView
             [$this->button('👥 风险用户', 'r:u:1'), $this->button('⚡ 最近事件', 'r:e:1')],
             [$this->button('📧 邮箱名单', 'r:l:email:1'), $this->button('🌐 IP 名单', 'r:l:ip:1')],
             [$this->button('🧩 UA 名单', 'r:l:ua:1'), $this->button('🏢 ASN 名单', 'r:l:asn:1')],
-            [$this->button('🟢 IP 白名单', 'r:l:allow_ip:1')],
+            [$this->button('🟢 IP 白名单', 'r:l:allow_ip:1'), $this->button('📊 今日概况', 'r:d')],
             [$this->button('📝 操作记录', 'r:a:1'), $this->button('🩺 系统状态', 'r:h')],
         ]);
     }
@@ -152,7 +152,8 @@ class RiskView
             $this->time($lastError['at'] ?? null, 'm-d H:i')) . ' ' . $this->code($this->shorten($lastError['message'] ?? '', 80)) : '');
         $lines[] = '订阅上限：' . $this->escape($stats['daily_limit'] ? $stats['daily_limit'] . ' 次/天，超过返回 429' : '不限');
         $lines[] = '节点出口 IP：' . $stats['nodes'] . $this->escape(' 个（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）');
-        $lines[] = '关联检测：' . (RiskSettings::get('link_detection') ? '开 · 同 IP ' . (int)RiskSettings::get('link_ip_users') . ' 人起报' : '关');
+        $lines[] = '关联检测：' . (RiskSettings::get('link_detection') ? '开 · 同 IP ' . (int)RiskSettings::get('link_ip_users') . ' 人起报' : '关') .
+            ' · 每晚日报：' . (RiskSettings::get('daily_report') ? '开' : '关');
         $mixed = $risk->mixedHoneypotNodes();
         if ($mixed) $lines[] = "\n⚠️ 这些节点同时属于蜜罐组和普通组：" . $this->escape(implode(', ', $mixed));
         if ($honeypot > 0 && !$group) $lines[] = "\n⚠️ 蜜罐权限组不存在：被隔离的用户拿不到任何节点";
@@ -183,6 +184,7 @@ class RiskView
             '查看' => [
                 '/riskusers  已隔离的用户',
                 '/events  最近事件',
+                '/report  今日概况：访问、告警和要留意的用户（每晚 00:05 发前一天的日报）',
                 '/audit  操作记录',
                 '/health  风控状态',
                 '/id  我的 Telegram ID（在群里还有群的 Chat ID）',
@@ -194,7 +196,8 @@ class RiskView
                 return $this->escape($line);
             }, $lines));
         }
-        $text .= "\n\n" . $this->escape('回复一条告警或用户卡片发 /add、/del、/search，回复一条告警发 /addip、/delip、/addallow，可以不写参数。');
+        $text .= "\n\n" . $this->escape('回复一条告警或用户卡片发 /add、/del、/search，回复一条告警发 /addip、/delip、/addallow，可以不写参数。') .
+            "\n" . $this->escape('用户卡片和告警上的「重置订阅」会换掉订阅链接和 UUID，分享出去的立刻失效；用户本人要重新导入订阅。');
         return $this->view($text, [[$this->button('🏠 菜单', 'r:m')]]);
     }
 
@@ -232,6 +235,7 @@ class RiskView
     {
         $rows = [[
             $this->isolated($user) ? $this->button('🔓 解除隔离', "r:r:c:{$user->id}") : $this->button('🔒 隔离', "r:i:c:{$user->id}"),
+            $this->button('♻️ 重置订阅', "r:s:c:{$user->id}"),
         ]];
         if ($this->limitedToday($user)) $rows[] = [$this->button('✅ 今天放行', "r:t:c:{$user->id}")];
         $rows[] = [
@@ -283,7 +287,7 @@ class RiskView
     /**
      * Buttons under an alert about a user. A public IP that is not allowlisted can be added to the IP list (unless it
      * is listed already) or allowlisted, on its own row so as not to be taken for the other. Alerts of what a check
-     * found (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行.
+     * found (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行, 重置订阅.
      */
     public function alertKeyboard(User $user, ?RiskEvent $event): array
     {
@@ -302,6 +306,9 @@ class RiskView
             if ($event->event_type === 'sub_limit' && $this->limitedToday($user)) {
                 $finding[] = $this->button('✅ 今天放行', "r:t:a:{$user->id}:{$eventId}");
             }
+            if (in_array($event->event_type, ['sub_limit', 'ip_users'], true)) {
+                $finding[] = $this->button('♻️ 重置订阅', "r:s:a:{$user->id}:{$eventId}");
+            }
             if ($finding) $rows[] = $finding;
             $risk = new RiskService();
             $allowable = $risk->allowRangeFor((string)$event->ip) !== null && !$risk->allowEntryFor((string)$event->ip);
@@ -312,6 +319,61 @@ class RiskView
             if ($allowable) $rows[] = [$this->button('🟢 放行此 IP（白名单）', "r:w:{$event->id}")];
         }
         return $rows;
+    }
+
+    /**
+     * The daily report (or today's so far): the numbers of RiskLinkService::report() and the users to look at, each
+     * with a button to their card. $menu: a 🏠 菜单 button as well, when it replaces the menu message.
+     */
+    public function report(array $data, bool $menu): array
+    {
+        $partial = $data['to'] > time() - 60;
+        $title = $partial ? '📊 *今日概况* ' . $this->escape(date('m-d', $data['from']) . ' 截至 ' . date('H:i', min($data['to'], time())))
+            : '📊 *风控日报* ' . $this->escape(date('m-d', $data['from']));
+        $lines = [
+            $title,
+            $this->escape("活跃 {$data['active']} 人 · 订阅 {$data['subscriptions']} 次 · 登录 {$data['logins']}（密码错误 {$data['failed_logins']}）· " .
+                "注册 {$data['registrations']} · 下单 {$data['orders']} · 支付 {$data['paid']}"),
+            $this->escape("风险事件 {$data['events']} 条 · 新隔离 {$data['isolated']} 人 · 订阅超限 {$data['limited']} 人 · " .
+                "关联告警 {$data['link_alerts']} 条" . ($data['skipped_alerts'] ? "（超出每天上限没发的 {$data['skipped_alerts']} 条）" : '')),
+        ];
+        $users = [];
+        $user = function (array $row) use (&$users): string {
+            $users[$row['user_id']] = $row['email'] ?? null;
+            return 'uid ' . $this->code($row['user_id']) . ($row['email'] ? ' ' . $this->code($this->shorten($row['email'], 28)) : '');
+        };
+        $sections = [
+            '订阅最多' => array_map(function ($row) use ($user) {
+                return $user($row) . $this->escape(" {$row['total']} 次 · {$row['ips']} 个 IP · {$row['clients']} 个客户端");
+            }, $data['top_subscribers']),
+            '同 IP 多用户' => array_map(function ($row) {
+                $where = trim(($row['location'] ?? '') . ' ' . ($row['network'] ?? ''));
+                return $this->code($row['ip_net']) . ($where !== '' ? ' ' . $this->escape($where) : '') .
+                    $this->escape(" · {$row['users']} 人" . ($row['isolated'] ? "（含已隔离 {$row['isolated']}）" : ''));
+            }, $data['shared_ips']),
+            '多地区' => array_map(function ($row) use ($user) {
+                return $user($row) . $this->escape(" {$row['places']} 个地区 · {$row['asns']} 个 ASN");
+            }, $data['regions']),
+            '密码错误最多' => array_map(function ($row) use ($user) {
+                return $user($row) . $this->escape(" {$row['total']} 次 · {$row['ips']} 个 IP");
+            }, $data['failed']),
+            '可疑客户端' => array_map(function ($row) use ($user) {
+                $ua = trim($row['user_agent']);
+                return $user($row) . ' ' . $this->code($ua === '' ? '空 UA' : $this->shorten($ua, 32)) . $this->escape(" {$row['total']} 次");
+            }, $data['scripts']),
+        ];
+        foreach ($sections as $name => $rows) {
+            if ($rows) $lines[] = "\n*" . $this->escape($name) . "*\n" . implode("\n", $rows);
+        }
+        $lines[] = "\n" . $this->escape('访问记录 ' . $this->tableSize($data['table_rows'], $data['table_bytes']) . " · 保留 {$data['days']} 天" .
+            ($data['errors'] ? " · 写入失败 {$data['errors']} 次" : ''));
+        $buttons = [];
+        foreach (array_slice($users, 0, 8, true) as $id => $email) {
+            $buttons[] = $this->button('👤 ' . ($email ? $this->shorten($email, 20) : "uid {$id}"), "r:cr:{$id}");
+        }
+        $keyboard = array_chunk($buttons, 2);
+        if ($menu) $keyboard[] = [$this->button('🏠 菜单', 'r:m')];
+        return $this->view(implode("\n", $lines), $keyboard);
     }
 
     public function confirmKeyboard(string $label, string $confirm, string $cancel): array

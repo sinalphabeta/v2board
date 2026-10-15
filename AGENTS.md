@@ -50,7 +50,7 @@ through `RiskService`. Read the code before changing it:
   limit (`guardClient()` in `RiskService`, called from the client middleware) and the nodes' exit IPs (remembered by
   the node APIs).
 - `app/Services/RiskLinkService.php`: links between accounts (checked at registration and by `risk:scan` every 10
-  minutes, alerted as risk events with a `detail`, never acted on).
+  minutes, alerted as risk events with a `detail`, never acted on) and the daily report (`risk:summary`, 00:05).
 - `app/Services/RiskSettings.php`: settings in `v2_risk_setting`, falling back to `.env` (`config/risk.php`);
   cached in Redis for 60 s and in each process for 3 s, `fresh()` for the admin pages.
 - `app/Services/IpInfoService.php`: the qqwry and DB-IP city / ASN databases (`risk:geoip-update`); `lookup()` for

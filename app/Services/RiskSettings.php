@@ -28,6 +28,7 @@ class RiskSettings
         'sub_daily_limit' => 0,
         'link_detection' => true,
         'link_ip_users' => 3,
+        'daily_report' => true,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;

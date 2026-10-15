@@ -18,6 +18,7 @@ use App\Models\ServerV2node;
 use App\Models\ServerVless;
 use App\Models\ServerVmess;
 use App\Models\User;
+use App\Utils\Helper;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -31,7 +32,7 @@ class RiskService
      * the event's detail.
      */
     public const FINDING_TYPES = ['sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联'];
-    // Alerts of each finding type a day; the rest are only recorded as risk events
+    // Alerts of each finding type a day; the rest are only in the daily report
     public const ALERT_BUDGET = 20;
     /**
      * Indicator types. allow_ip is an allowlist: requests from its IPs skip the IP and ASN rules. The others are
@@ -395,6 +396,19 @@ class RiskService
     }
 
     /**
+     * Give the user a new subscription token and UUID, as the admin panel's 重置UUID及订阅URL does: the old
+     * subscription link stops working at once, and the nodes refuse the old UUID within about a minute.
+     */
+    public function resetSubscription(User $user): bool
+    {
+        $user->token = Helper::guid();
+        $user->uuid = Helper::guid(true);
+        if (!$user->save()) return false;
+        $this->audit('reset', null, [], $user);
+        return true;
+    }
+
+    /**
      * Record what a check found about a user as a risk event of a FINDING_TYPES type, with $detail as the evidence, and
      * alert it unless today's alerts of the type have reached ALERT_BUDGET. $key identifies the finding: recording it
      * again updates the same event (and alerts again unless $alert is false).
@@ -425,12 +439,28 @@ class RiskService
         return $event;
     }
 
+    /**
+     * How many alerts of each finding type were left out today (or on the day of $time) for going over ALERT_BUDGET.
+     */
+    public function skippedAlerts(?int $time = null): int
+    {
+        $total = 0;
+        foreach (array_keys(self::FINDING_TYPES) as $type) {
+            try { $total += (int)Cache::get("risk:alert-skipped:{$type}:" . date('Ymd', $time ?? time()), 0); } catch (\Throwable $e) { }
+        }
+        return $total;
+    }
+
     private function withinAlertBudget(string $type): bool
     {
         try {
             $key = "risk:alert-budget:{$type}:" . date('Ymd');
             Cache::add($key, 0, 2 * 86400);
-            return (int)Cache::increment($key) <= self::ALERT_BUDGET;
+            if ((int)Cache::increment($key) <= self::ALERT_BUDGET) return true;
+            $skipped = "risk:alert-skipped:{$type}:" . date('Ymd');
+            Cache::add($skipped, 0, 2 * 86400);
+            Cache::increment($skipped);
+            return false;
         } catch (\Throwable $e) {
             return true;
         }

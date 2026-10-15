@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\RiskAccess;
+use App\Models\RiskAudit;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\User;
@@ -12,6 +13,7 @@ use Illuminate\Support\Facades\Cache;
 /**
  * Links between accounts found in the access log, alerted as risk events (RiskService::recordFinding()) and never acted
  * on: the admin decides. Private IPs, the IP allowlist and the nodes' exit IPs are left out, as IPs shared by design.
+ * Also the numbers of the daily report.
  */
 class RiskLinkService
 {
@@ -19,6 +21,10 @@ class RiskLinkService
     public const REGISTER_DAYS = 7;
     // An IP already alerted today is alerted again when its users reach this many
     public const IP_USERS_AGAIN = 10;
+    // Users with subscriptions from this many places (country and province) in a day are listed in the daily report
+    public const REPORT_REGIONS = 3;
+    // User agents of scripts rather than proxy clients, for the daily report (an empty one too)
+    private const SCRIPT_AGENTS = '^(curl|wget|python|go-http-client|java)';
     private $risk;
     private $access;
 
@@ -101,6 +107,101 @@ class RiskLinkService
     }
 
     /**
+     * Today's report so far (/report, 📊 今日概况).
+     */
+    public function reportToday(): array
+    {
+        // The end is exclusive: what happened this second counts too
+        return $this->report($this->access->day(time()), time() + 1);
+    }
+
+    /**
+     * The daily report's numbers for the day of $from, up to $to (exclusive): today so far, or a whole day.
+     * See RiskView::report().
+     */
+    public function report(int $from, int $to): array
+    {
+        $day = $this->access->day($from);
+        $types = RiskAccessService::TYPES;
+        $results = RiskAccessService::RESULTS;
+        $base = function () use ($day) { return RiskAccess::where('record_at', $day); };
+        $sums = $base()->selectRaw('event_type, result, SUM(occurrences) AS total')->groupBy('event_type', 'result')->get();
+        $sum = function (string $type, ?string $result = null) use ($sums, $types, $results) {
+            return (int)$sums->filter(function ($row) use ($type, $result, $types, $results) {
+                return (int)$row->event_type === $types[$type] && ($result === null || (int)$row->result === $results[$result]);
+            })->sum('total');
+        };
+        $stat = new StatisticalService();
+        $stat->setStartAt($from);
+        $stat->setEndAt($to);
+        $orders = $stat->generateStatData();
+
+        $top = $base()->where('event_type', $types['subscription'])
+            ->selectRaw('user_id, SUM(occurrences) AS total, COUNT(DISTINCT ip_net) AS ips, COUNT(DISTINCT ua_hash) AS clients')
+            ->groupBy('user_id')->orderByDesc('total')->limit(5)->get();
+        $failed = $base()->where('event_type', $types['login'])->where('result', $results['failed'])
+            ->selectRaw('user_id, SUM(occurrences) AS total, COUNT(DISTINCT ip_net) AS ips')
+            ->groupBy('user_id')->orderByDesc('total')->limit(5)->get();
+        $scripts = $base()->where('event_type', $types['subscription'])
+            ->where(function ($query) {
+                $query->where('user_agent', '')->orWhereRaw('`user_agent` REGEXP ?', [self::SCRIPT_AGENTS]);
+            })
+            ->selectRaw('user_id, user_agent, SUM(occurrences) AS total')->groupBy('user_id', 'user_agent')
+            ->orderByDesc('total')->limit(5)->get();
+        $shared = array_slice($this->sharedIps($day), 0, 5);
+        $regions = $this->regions($day);
+        $ids = $top->pluck('user_id')->merge($failed->pluck('user_id'))->merge($scripts->pluck('user_id'))
+            ->merge(array_column($regions, 'user_id'))->unique()->values();
+        $emails = User::whereIn('id', $ids)->pluck('email', 'id');
+        $email = function ($id) use ($emails) { return $emails[$id] ?? null; };
+        $info = $shared ? (new IpInfoService())->lookupMany(array_column($shared, 'ip')) : [];
+        $stats = $this->access->stats();
+
+        return [
+            'from' => $from,
+            'to' => $to,
+            'active' => $base()->where('event_type', $types['subscription'])->distinct()->count('user_id'),
+            'subscriptions' => $sum('subscription'),
+            'logins' => $sum('login', 'ok'),
+            'failed_logins' => $sum('login', 'failed'),
+            'registrations' => (int)$orders['register_count'],
+            'orders' => (int)$orders['order_count'],
+            'paid' => (int)$orders['paid_count'],
+            'events' => RiskEvent::where('last_seen_at', '>=', $from)->where('last_seen_at', '<', $to)->count(),
+            'isolated' => RiskAudit::where('action', 'mark')->where('created_at', '>=', $from)->where('created_at', '<', $to)
+                ->distinct()->count('user_id'),
+            'limited' => RiskEvent::where('event_type', 'sub_limit')->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
+            'link_alerts' => RiskEvent::whereIn('event_type', ['ip_users', 'register_link'])
+                ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
+            'skipped_alerts' => $this->risk->skippedAlerts($from),
+            'top_subscribers' => $top->map(function ($row) use ($email) {
+                return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'total' => (int)$row->total,
+                    'ips' => (int)$row->ips, 'clients' => (int)$row->clients];
+            })->all(),
+            'shared_ips' => array_map(function ($entry) use ($info) {
+                return [
+                    'ip_net' => $entry['ip_net'], 'users' => $entry['users'], 'isolated' => $entry['isolated'],
+                    'location' => $info[$entry['ip']]['location'] ?? null, 'network' => $info[$entry['ip']]['network'] ?? null,
+                ];
+            }, $shared),
+            'regions' => array_map(function ($entry) use ($email) {
+                return $entry + ['email' => $email($entry['user_id'])];
+            }, $regions),
+            'failed' => $failed->map(function ($row) use ($email) {
+                return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'total' => (int)$row->total, 'ips' => (int)$row->ips];
+            })->all(),
+            'scripts' => $scripts->map(function ($row) use ($email) {
+                return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'user_agent' => (string)$row->user_agent,
+                    'total' => (int)$row->total];
+            })->all(),
+            'table_rows' => $stats['table_rows'],
+            'table_bytes' => $stats['table_bytes'],
+            'days' => $stats['days'],
+            'errors' => $this->writeErrors($from),
+        ];
+    }
+
+    /**
      * The day's IPs (an IPv6 /64) with several users subscribing or logged in, left-out IPs aside, the most users
      * first: link_ip_users or more, or two with an isolated one among them. Each with its users (list: up to 5, with
      * what they did), the isolated count and the user to alert about (the latest one not isolated).
@@ -142,6 +243,38 @@ class RiskLinkService
     }
 
     /**
+     * Users who subscribed from REPORT_REGIONS or more places (country and province, from the IP's location) in the
+     * day, left-out IPs aside, with their ASNs too: up to 5, the most places first. The location is only counted here,
+     * never matched against.
+     */
+    private function regions(int $day): array
+    {
+        $rows = RiskAccess::where('record_at', $day)->where('event_type', RiskAccessService::TYPES['subscription'])
+            ->where('ip_net', '!=', '')->get(['user_id', 'ip', 'ip_net']);
+        $exclude = $this->excluder();
+        $rows = $rows->reject(function (RiskAccess $row) use ($exclude) { return $exclude((string)$row->ip, (string)$row->ip_net); });
+        // Only users with several IPs can have several places
+        $rows = $rows->groupBy('user_id')->filter(function ($rows) { return $rows->pluck('ip_net')->unique()->count() >= self::REPORT_REGIONS; });
+        if (!$rows->count()) return [];
+        $info = (new IpInfoService())->lookupMany($rows->flatten(1)->pluck('ip')->unique()->values()->all());
+        $regions = [];
+        foreach ($rows as $userId => $userRows) {
+            $places = $asns = [];
+            foreach ($userRows as $row) {
+                $location = $info[$row->ip]['location'] ?? null;
+                if ($location) $places[implode(' ', array_slice(explode(' ', $location), 0, 2))] = true;
+                $asn = $info[$row->ip]['asn_number'] ?? null;
+                if ($asn) $asns[$asn] = true;
+            }
+            if (count($places) >= self::REPORT_REGIONS) {
+                $regions[] = ['user_id' => (int)$userId, 'places' => count($places), 'asns' => count($asns)];
+            }
+        }
+        usort($regions, function ($a, $b) { return [$b['places'], $b['asns']] <=> [$a['places'], $a['asns']]; });
+        return array_slice($regions, 0, 5);
+    }
+
+    /**
      * Whether an IP (and its ip_net) is left out of the checks: private or reserved, in the IP allowlist, or a node's.
      */
     private function excluder(): callable
@@ -155,6 +288,15 @@ class RiskLinkService
             }
             return false;
         };
+    }
+
+    private function writeErrors(int $time): int
+    {
+        try {
+            return (int)Cache::get('risk:access:errors:' . date('Ymd', $time), 0);
+        } catch (\Throwable $e) {
+            return 0;
+        }
     }
 
     private function uids(array $ids): string

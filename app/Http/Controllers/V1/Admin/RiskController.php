@@ -24,7 +24,7 @@ use Illuminate\Http\Request;
  */
 class RiskController extends Controller
 {
-    private const ACTIONS = ['add', 'edit', 'delete', 'mark', 'unmark', 'setting', 'exempt'];
+    private const ACTIONS = ['add', 'edit', 'delete', 'mark', 'unmark', 'setting', 'reset', 'exempt'];
 
     public function overview()
     {
@@ -105,7 +105,7 @@ class RiskController extends Controller
             if ($invalid) abort(500, '可信代理里这些不是 IP 或 CIDR：' . implode('、', $invalid));
             $values['trusted_proxies'] = implode(',', array_unique($proxies));
         }
-        foreach (['access_log_enabled', 'link_detection'] as $name) {
+        foreach (['access_log_enabled', 'link_detection', 'daily_report'] as $name) {
             if (!$request->has($name)) continue;
             $enabled = (string)$request->input($name);
             if (!in_array($enabled, ['0', '1'], true)) abort(500, '参数错误');

@@ -176,10 +176,11 @@ class RiskBot
             case 'l': $this->edit($context, $this->view->indicators((string)($parts[2] ?? ''), $int(3))); return '';
             case 'a': $this->edit($context, $this->view->audit($int(2))); return '';
             case 'h': $this->edit($context, $this->view->health()); return '';
+            case 'd': $this->edit($context, $this->view->report((new RiskService())->links()->reportToday(), true)); return '';
             case 'n': return $this->ipUsers(str_replace('-', ':', (string)($parts[2] ?? '')), $context);
         }
         if (in_array($verb, ['p', 'P', 'k', 'w', 'W'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $admin);
-        if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x', 't', 'T'], true)) return '';
+        if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x', 's', 'S', 't', 'T'], true)) return '';
 
         $card = in_array($verb, ['c', 'cr', 'ue'], true);
         $user = User::find($card ? $int(2) : $int(3));
@@ -204,8 +205,8 @@ class RiskBot
     }
 
     /**
-     * From an alert ('a') or a user card ('c'): isolating or releasing a user, letting their subscriptions through
-     * today. Ask first, then do it.
+     * From an alert ('a') or a user card ('c'): isolating or releasing a user, resetting their subscription, letting
+     * their subscriptions through today. Ask first, then do it.
      */
     private function userAction(string $verb, string $where, User $user, ?RiskEvent $event, $context, User $admin): string
     {
@@ -213,6 +214,12 @@ class RiskBot
         $email = $this->view->shorten($user->email, 32);
         if ($verb === 'i') return $this->askToConfirm($context, "确认隔离 {$email}", "r:I:{$suffix}", "r:x:{$suffix}");
         if ($verb === 'r') return $this->askToConfirm($context, "确认解除 {$email}", "r:R:{$suffix}", "r:x:{$suffix}");
+        if ($verb === 's') {
+            $this->askToConfirm($context, "确认重置 {$email} 的订阅", "r:S:{$suffix}", "r:x:{$suffix}");
+            $context->alert = true;
+            return "重置 {$email} 的订阅：换掉订阅链接和 UUID。旧链接马上失效，大约 1 分钟后旧 UUID 也连不上节点，分享出去的都不能用了；" .
+                '用户本人要在所有设备上重新导入订阅。';
+        }
         if ($verb === 't') return $this->askToConfirm($context, "确认今天放行 {$email}", "r:T:{$suffix}", "r:x:{$suffix}");
 
         $service = (new RiskService())->actingAs('bot', $admin->id);
@@ -235,6 +242,12 @@ class RiskBot
             } else {
                 $service->releaseUser($user);
                 [$notice, $line] = ['已解除隔离', '🔓 已解除隔离'];
+            }
+        } elseif ($verb === 'S') {
+            if ($service->resetSubscription($user)) {
+                [$notice, $line] = ['已重置订阅，旧链接已失效', '♻️ 已重置订阅'];
+            } else {
+                $notice = '重置失败，请检查服务日志';
             }
         } elseif ($verb === 'T') {
             $service->exemptToday($user);
