@@ -144,7 +144,7 @@ class RiskView
                 '/events  最近事件',
                 '/audit  操作记录',
                 '/health  风控状态',
-                '/id  我的 Telegram ID',
+                '/id  我的 Telegram ID（在群里还有群的 Chat ID）',
             ],
         ];
         $text = '*风控 Bot 帮助*';
