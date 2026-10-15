@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Exceptions\RiskIpAllowlistedException;
 use App\Jobs\SendRiskTelegramJob;
 use App\Models\Plan;
+use App\Models\RiskAccess;
 use App\Models\RiskAudit;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
@@ -25,6 +26,13 @@ class RiskService
 {
     public const STATUS_NONE = 0;
     public const STATUS_RISK = 1;
+    /**
+     * Risk events that are not a matched request but something a check found (recordFinding()), with what it found in
+     * the event's detail.
+     */
+    public const FINDING_TYPES = ['sub_limit' => '订阅超限'];
+    // Alerts of each finding type a day; the rest are only recorded as risk events
+    public const ALERT_BUDGET = 20;
     /**
      * Indicator types. allow_ip is an allowlist: requests from its IPs skip the IP and ASN rules. The others are
      * risk rules (RULE_TYPES): a match is recorded and alerted, and an email match also isolates the user.
@@ -344,21 +352,103 @@ class RiskService
     }
 
     /**
-     * The client middleware's check once it has the user of a subscription token: observe and log the request.
-     * client/app/getVersion (no nodes) and HEAD requests are observed but neither counted nor logged.
+     * The client middleware's check once it has the user of a subscription token: observe and log the request, and
+     * answer a subscription over the daily limit with RiskAccessService::limitResponse() instead of the nodes (null
+     * otherwise). client/app/getVersion (no nodes) and HEAD requests are observed but neither counted nor logged.
      */
-    public function observeClient(User $user, Request $request): void
+    public function guardClient(User $user, Request $request)
     {
         $route = $request->route();
         if (($route && $route->getActionMethod() === 'getVersion') || $request->isMethod('HEAD')) {
             $this->observe($user, 'subscription', $request, false, null);
-            return;
+            return null;
         }
-        $count = $this->access()->countSubscription($user);
+        $access = $this->access();
+        $count = $access->countSubscription($user);
+        $limited = $access->overLimit($user, $count);
         if ((int)$user->risk_status === self::STATUS_RISK) $result = 'isolated';
+        elseif ($limited) $result = 'limited';
         elseif (!(new UserService())->isAvailable($user)) $result = 'unavailable';
         else $result = 'ok';
         $this->observe($user, 'subscription', $request, false, $result, $count);
+        if (!$limited) return null;
+        $this->limitAlert($user, $request, $count);
+        return $access->limitResponse();
+    }
+
+    /**
+     * Let the user subscribe without the daily limit until midnight (今天放行).
+     */
+    public function exemptToday(User $user): void
+    {
+        $this->access()->exemptToday($user);
+        $this->audit('exempt', null, [], $user);
+    }
+
+    /**
+     * Record what a check found about a user as a risk event of a FINDING_TYPES type, with $detail as the evidence, and
+     * alert it unless today's alerts of the type have reached ALERT_BUDGET. $key identifies the finding: recording it
+     * again updates the same event (and alerts again unless $alert is false).
+     */
+    public function recordFinding(User $user, string $type, string $ip, string $ua, string $detail, string $key, bool $alert = true): ?RiskEvent
+    {
+        $ua = $this->cleanUserAgent($ua, 512);
+        $detail = mb_substr($detail, 0, 255, 'UTF-8');
+        $now = time();
+        try {
+            $fingerprint = hash('sha256', 'finding|' . $key);
+            $event = RiskEvent::where('fingerprint', $fingerprint)->first();
+            if ($event) {
+                $event->fill(['user_id' => $user->id, 'ip' => $ip, 'user_agent' => $ua, 'detail' => $detail, 'last_seen_at' => $now]);
+                $event->occurrences = (int)$event->occurrences + 1;
+                $event->save();
+            } else {
+                $event = RiskEvent::create([
+                    'fingerprint' => $fingerprint, 'user_id' => $user->id, 'event_type' => $type, 'ip' => $ip,
+                    'user_agent' => $ua, 'indicator_ids' => '[]', 'detail' => $detail, 'first_seen_at' => $now,
+                    'last_seen_at' => $now, 'occurrences' => 1,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            return null;
+        }
+        if ($alert && $this->withinAlertBudget($type)) $this->notify($user, $type, $ip, $ua, $detail, (int)$event->id);
+        return $event;
+    }
+
+    private function withinAlertBudget(string $type): bool
+    {
+        try {
+            $key = "risk:alert-budget:{$type}:" . date('Ymd');
+            Cache::add($key, 0, 2 * 86400);
+            return (int)Cache::increment($key) <= self::ALERT_BUDGET;
+        } catch (\Throwable $e) {
+            return true;
+        }
+    }
+
+    /**
+     * The first subscription over the limit each day alerts: how many today, from how many IPs, with which clients.
+     */
+    private function limitAlert(User $user, Request $request, int $count): void
+    {
+        try {
+            if (!Cache::add('risk:sub-alerted:' . (int)$user->id . ':' . date('Ymd'), 1, 2 * 86400)) return;
+            $rows = RiskAccess::where('record_at', $this->access()->day(time()))->where('user_id', $user->id)
+                ->where('event_type', RiskAccessService::TYPES['subscription'])->get(['ip_net', 'ua_hash', 'user_agent', 'occurrences']);
+            $clients = $rows->groupBy('ua_hash')->map(function ($rows) {
+                return ['ua' => (string)$rows->first()->user_agent, 'total' => (int)$rows->sum('occurrences')];
+            })->sortByDesc('total')->take(3)->map(function ($client) {
+                $ua = trim(preg_replace('/\s+/', ' ', $client['ua']));
+                return ($ua === '' ? '空 UA' : mb_substr($ua, 0, 30, 'UTF-8')) . ' ×' . $client['total'];
+            })->implode('、');
+            $detail = "今天第 {$count} 次（上限 {$this->access()->dailyLimit()}）· " .
+                $rows->pluck('ip_net')->filter()->unique()->count() . ' 个 IP · 客户端 ' . $clients;
+            $this->recordFinding($user, 'sub_limit', $this->clientIp($request), (string)$request->header('User-Agent', ''), $detail,
+                'sub_limit|' . (int)$user->id . '|' . date('Ymd'));
+        } catch (\Throwable $e) {
+            // An alert must never change the answer
+        }
     }
 
     public function recordEvent(?User $user, string $eventType, ?Request $request, array $matches = []): void
@@ -418,6 +508,7 @@ class RiskService
 
     /**
      * Send a risk alert to the alert chat; with a user and an event it carries the risk bot's action buttons.
+     * $matches: the indicators matched, or for a finding (FINDING_TYPES) its detail.
      */
     public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = [], ?int $eventId = null): void
     {
@@ -428,6 +519,7 @@ class RiskService
         $rules = is_array($matches)
             ? implode(',', array_map(function ($m) { return $m->type . ':' . $m->value; }, $matches))
             : (string)$matches;
+        $finding = self::FINDING_TYPES[$eventType] ?? null;
         $escape = function ($value): string {
             return preg_replace_callback('/[_*\[\]()~`>#+\-=|{}.!\\\\]/', function ($match) {
                 return '\\' . $match[0];
@@ -436,10 +528,10 @@ class RiskService
         $code = function ($value): string {
             return '`' . str_replace(['\\', '`'], ['\\\\', '\\`'], (string)$value) . '`';
         };
-        $text = "*\\[RISK\\]* _" . $escape($eventType) . "_\nuid: `" . ($user ? (int)$user->id : '-') . "`" .
+        $text = "*\\[RISK\\]* _" . $escape($finding ?? $eventType) . "_\nuid: `" . ($user ? (int)$user->id : '-') . "`" .
             "\nemail: " . $code($user ? $user->email : '-') . "\nip: " . $code($ip) . "\nua: " . $code($ua) .
             "\nplan: " . $code($plan ? $plan->name : '-') . "\ngroup: " . $code($user ? $user->group_id : '-') .
-            "\nrules: " . $code($rules);
+            ($finding ? "\ndetail: " : "\nrules: ") . $code($rules);
         $token = (string)RiskSettings::get('bot_token');
         if (!$token) return;
         try {

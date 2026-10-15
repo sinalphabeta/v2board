@@ -10,7 +10,8 @@ use Illuminate\Support\Facades\DB;
 
 /**
  * The access log (v2_risk_access): every login, registration, subscription and order, one row per day (record_at, the
- * day's 0:00), user, type, result, IP and user agent, kept for access_log_days days. Also the exit IPs of the nodes.
+ * day's 0:00), user, type, result, IP and user agent, kept for access_log_days days. Also the daily subscription limit,
+ * and the exit IPs of the nodes.
  *
  * An IPv6 address is merged by its /64 (ip_net), since clients rotate their addresses; ip keeps the last one seen.
  * Rows are written one statement each, outside any transaction; a write never fails the request: errors are reported at
@@ -22,9 +23,9 @@ class RiskAccessService
     public const TYPE_NAMES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'order' => '下单'];
     /**
      * ok; failed: a wrong password; isolated: the honeypot nodes, or isolated on registration; unavailable: banned,
-     * expired or without a plan (no nodes)
+     * expired or without a plan (no nodes); limited: over the daily limit (answered 429)
      */
-    public const RESULTS = ['ok' => 0, 'failed' => 1, 'isolated' => 2, 'unavailable' => 3];
+    public const RESULTS = ['ok' => 0, 'failed' => 1, 'isolated' => 2, 'unavailable' => 3, 'limited' => 4];
     // After this many subscriptions in a day, a user's new IP and user agent combinations go into one row (ip_net ''):
     // a client may send a new user agent each time
     public const OVERFLOW_AFTER = 1000;
@@ -69,7 +70,7 @@ class RiskAccessService
     }
 
     /**
-     * Count a subscription: how many the user has made today, or 0 if Redis is down.
+     * Count a subscription: how many the user has made today, or 0 if Redis is down (nothing is limited then).
      */
     public function countSubscription(User $user): int
     {
@@ -81,6 +82,60 @@ class RiskAccessService
         } catch (\Throwable $e) {
             return 0;
         }
+    }
+
+    public function subscriptionsToday(User $user): int
+    {
+        try {
+            return (int)Cache::get($this->countKey($user), 0);
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    public function dailyLimit(): int
+    {
+        return max(0, (int)RiskSettings::get('sub_daily_limit'));
+    }
+
+    /**
+     * Whether the user's $count-th subscription today goes over the daily limit. Isolated users never do (they keep
+     * getting the honeypot nodes), nor users let through for today.
+     */
+    public function overLimit(User $user, int $count): bool
+    {
+        $limit = $this->dailyLimit();
+        if ($limit <= 0 || $count <= $limit) return false;
+        if ((int)$user->risk_status === RiskService::STATUS_RISK) return false;
+        return !$this->exempt($user);
+    }
+
+    /**
+     * Whether the user is let through for today (今天放行).
+     */
+    public function exempt(User $user): bool
+    {
+        try {
+            return (bool)Cache::get($this->exemptKey($user));
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    public function exemptToday(User $user): void
+    {
+        Cache::put($this->exemptKey($user), 1, max(60, strtotime('tomorrow') - time() + 60));
+    }
+
+    /**
+     * The answer to a subscription over the limit: clients report a failed update and keep the nodes they have.
+     */
+    public function limitResponse()
+    {
+        return response('今日订阅更新次数已达上限，请明天再试', 429, [
+            'Content-Type' => 'text/plain; charset=UTF-8',
+            'Retry-After' => (string)max(1, strtotime('tomorrow') - time()),
+        ]);
     }
 
     /**
@@ -235,6 +290,7 @@ class RiskAccessService
             'errors_today' => $errors,
             'last_error' => is_array($lastError) ? $lastError : null,
             'nodes' => count($this->nodeNets()),
+            'daily_limit' => $this->dailyLimit(),
         ];
     }
 
@@ -279,6 +335,11 @@ class RiskAccessService
     private function countKey(User $user): string
     {
         return 'risk:sub-count:' . (int)$user->id . ':' . date('Ymd');
+    }
+
+    private function exemptKey(User $user): string
+    {
+        return 'risk:sub-exempt:' . (int)$user->id . ':' . date('Ymd');
     }
 
     private function risk(): RiskService

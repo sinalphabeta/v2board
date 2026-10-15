@@ -952,3 +952,6 @@ CREATE TABLE IF NOT EXISTS `v2_risk_access` (
   KEY `risk_access_user` (`user_id`,`record_at`),
   KEY `risk_access_net` (`ip_net`,`record_at`,`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+ALTER TABLE `v2_risk_event`
+  ADD `detail` varchar(255) DEFAULT NULL AFTER `indicator_ids`;

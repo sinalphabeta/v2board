@@ -25,6 +25,7 @@ class RiskSettings
         // The access log and what is built on it (RiskAccessService); these have no .env fallback
         'access_log_enabled' => true,
         'access_log_days' => 90,
+        'sub_daily_limit' => 0,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;

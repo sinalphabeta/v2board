@@ -178,7 +178,7 @@ class RiskBot
             case 'h': $this->edit($context, $this->view->health()); return '';
         }
         if (in_array($verb, ['p', 'P', 'k', 'w', 'W'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $admin);
-        if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x'], true)) return '';
+        if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x', 't', 'T'], true)) return '';
 
         $card = in_array($verb, ['c', 'cr', 'ue'], true);
         $user = User::find($card ? $int(2) : $int(3));
@@ -191,7 +191,8 @@ class RiskBot
     }
 
     /**
-     * Isolating or releasing a user from an alert ('a') or a user card ('c'): ask first, then do it.
+     * From an alert ('a') or a user card ('c'): isolating or releasing a user, letting their subscriptions through
+     * today. Ask first, then do it.
      */
     private function userAction(string $verb, string $where, User $user, ?RiskEvent $event, $context, User $admin): string
     {
@@ -199,6 +200,7 @@ class RiskBot
         $email = $this->view->shorten($user->email, 32);
         if ($verb === 'i') return $this->askToConfirm($context, "确认隔离 {$email}", "r:I:{$suffix}", "r:x:{$suffix}");
         if ($verb === 'r') return $this->askToConfirm($context, "确认解除 {$email}", "r:R:{$suffix}", "r:x:{$suffix}");
+        if ($verb === 't') return $this->askToConfirm($context, "确认今天放行 {$email}", "r:T:{$suffix}", "r:x:{$suffix}");
 
         $service = (new RiskService())->actingAs('bot', $admin->id);
         $notice = '';
@@ -221,6 +223,9 @@ class RiskBot
                 $service->releaseUser($user);
                 [$notice, $line] = ['已解除隔离', '🔓 已解除隔离'];
             }
+        } elseif ($verb === 'T') {
+            $service->exemptToday($user);
+            [$notice, $line] = ['今天不再限制这个用户的订阅', '✅ 今天已放行'];
         }
         $user->refresh();
         if ($where === 'c') {

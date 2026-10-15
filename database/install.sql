@@ -624,6 +624,7 @@ CREATE TABLE `v2_risk_event` (
   `ip` varchar(45) NOT NULL,
   `user_agent` varchar(512) NOT NULL,
   `indicator_ids` text,
+  `detail` varchar(255) DEFAULT NULL,
   `first_seen_at` int(11) NOT NULL,
   `last_seen_at` int(11) NOT NULL,
   `occurrences` int(11) NOT NULL DEFAULT '1',

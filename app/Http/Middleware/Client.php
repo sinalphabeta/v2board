@@ -73,7 +73,8 @@ class Client
         $request->merge([
             'user' => $user
         ]);
-        (new RiskService())->observeClient($user, $request);
+        $limited = (new RiskService())->guardClient($user, $request);
+        if ($limited) return $limited;
         return $next($request);
     }
 }

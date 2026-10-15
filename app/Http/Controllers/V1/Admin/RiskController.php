@@ -24,7 +24,7 @@ use Illuminate\Http\Request;
  */
 class RiskController extends Controller
 {
-    private const ACTIONS = ['add', 'edit', 'delete', 'mark', 'unmark', 'setting'];
+    private const ACTIONS = ['add', 'edit', 'delete', 'mark', 'unmark', 'setting', 'exempt'];
 
     public function overview()
     {
@@ -113,6 +113,7 @@ class RiskController extends Controller
         }
         $ranges = [
             'access_log_days' => [7, 365, '访问记录保留天数应该是 7 到 365 之间的整数'],
+            'sub_daily_limit' => [0, 100000, '每天订阅上限应该是 0 到 100000 之间的整数，0 表示不限'],
         ];
         foreach ($ranges as $name => [$min, $max, $error]) {
             if (!$request->has($name)) continue;
@@ -308,6 +309,8 @@ class RiskController extends Controller
                         $rule = $rules->get($id);
                         return $rule ? "{$rule->type}:{$rule->value}" : "#{$id}";
                     }, $this->ruleIds($event)),
+                    // What a check found, for the event types in RiskService::FINDING_TYPES
+                    'detail' => $event->detail,
                 ] + $this->ipInfoFields($info[$event->ip] ?? null);
             })->values();
         });

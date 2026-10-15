@@ -22,22 +22,26 @@ use App\Services\RiskSettings;
  *   r:a:<page> audit log · r:h status · r:c:<uid> user card · r:cr:<uid> user card as a new reply
  *   r:ue:<uid>:<s|l|o>:<page> a user's subscriptions, logins or orders (the access log)
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
+ *   r:t:<ctx>:<uid>:<eid> ask to let the user's subscriptions through today, r:T:… do it
  *   r:p:<eid> ask to list the event's IP, r:P:<eid> do it · r:k:<eid> mark the alert handled
  *   r:w:<eid> ask to allowlist the event's IP, r:W:<eid> do it
  */
 class RiskView
 {
     public const TYPES = RiskService::TYPES;
-    private const EVENT_TYPES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'identity' => '命中'];
-    private const ACTIONS = ['add' => '新增', 'edit' => '编辑', 'delete' => '删除', 'mark' => '隔离用户', 'unmark' => '解除隔离', 'setting' => '修改设置'];
+    private const EVENT_TYPES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'identity' => '命中'] + RiskService::FINDING_TYPES;
+    private const ACTIONS = [
+        'add' => '新增', 'edit' => '编辑', 'delete' => '删除', 'mark' => '隔离用户', 'unmark' => '解除隔离', 'setting' => '修改设置',
+        'exempt' => '今天放行',
+    ];
     // Settings edited on the admin panel (RiskSettings)
     public const SETTINGS = [
         'bot_token' => 'Bot Token', 'alert_chat_id' => '告警群 Chat ID', 'honeypot_group_id' => '蜜罐权限组',
         'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
-        'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数',
+        'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
     ];
     // How an access log row's result shows, when it is not ok
-    private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用'];
+    private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
     private const FIELDS = ['value' => '值', 'note' => '备注', 'enabled' => '启用'];
     // Audit changes that the action itself already says
     private const IMPLIED = ['add' => ['value', 'enabled'], 'delete' => ['enabled']];
@@ -144,6 +148,7 @@ class RiskView
         $lastError = $stats['last_error'];
         $lines[] = '写入失败：今天 ' . $stats['errors_today'] . ' 次' . ($lastError ? $this->escape('，最近一次 ' .
             $this->time($lastError['at'] ?? null, 'm-d H:i')) . ' ' . $this->code($this->shorten($lastError['message'] ?? '', 80)) : '');
+        $lines[] = '订阅上限：' . $this->escape($stats['daily_limit'] ? $stats['daily_limit'] . ' 次/天，超过返回 429' : '不限');
         $lines[] = '节点出口 IP：' . $stats['nodes'] . $this->escape(' 个（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）');
         $mixed = $risk->mixedHoneypotNodes();
         if ($mixed) $lines[] = "\n⚠️ 这些节点同时属于蜜罐组和普通组：" . $this->escape(implode(', ', $mixed));
@@ -205,6 +210,7 @@ class RiskView
             '到期时间: ' . $this->escape($user->expired_at === null ? '长期有效' : date('Y-m-d H:i:s', (int)$user->expired_at)),
             '权限组: ' . $this->escape($user->group_id ?? '-'),
             '风险状态: ' . $this->riskStatus($user),
+            '今天订阅: ' . $this->escape($this->todayLine($user)),
         ];
         $registration = (new RiskAccessService())->registration($user);
         if ($registration) $lines[] = '注册 IP: ' . $this->code($registration->ip);
@@ -221,14 +227,16 @@ class RiskView
 
     public function cardKeyboard(User $user): array
     {
-        return [
-            [$this->isolated($user) ? $this->button('🔓 解除隔离', "r:r:c:{$user->id}") : $this->button('🔒 隔离', "r:i:c:{$user->id}")],
-            [
-                $this->button('📜 订阅记录', "r:ue:{$user->id}:s:1"), $this->button('🔑 登录记录', "r:ue:{$user->id}:l:1"),
-                $this->button('🛒 下单记录', "r:ue:{$user->id}:o:1"),
-            ],
-            [$this->button('🏠 菜单', 'r:m')],
+        $rows = [[
+            $this->isolated($user) ? $this->button('🔓 解除隔离', "r:r:c:{$user->id}") : $this->button('🔒 隔离', "r:i:c:{$user->id}"),
+        ]];
+        if ($this->limitedToday($user)) $rows[] = [$this->button('✅ 今天放行', "r:t:c:{$user->id}")];
+        $rows[] = [
+            $this->button('📜 订阅记录', "r:ue:{$user->id}:s:1"), $this->button('🔑 登录记录', "r:ue:{$user->id}:l:1"),
+            $this->button('🛒 下单记录', "r:ue:{$user->id}:o:1"),
         ];
+        $rows[] = [$this->button('🏠 菜单', 'r:m')];
+        return $rows;
     }
 
     /**
@@ -271,7 +279,8 @@ class RiskView
 
     /**
      * Buttons under an alert about a user. A public IP that is not allowlisted can be added to the IP list (unless it
-     * is listed already) or allowlisted, on its own row so as not to be taken for the other.
+     * is listed already) or allowlisted, on its own row so as not to be taken for the other. Alerts of what a check
+     * found (RiskService::FINDING_TYPES) also offer what fits them: 今天放行.
      */
     public function alertKeyboard(User $user, ?RiskEvent $event): array
     {
@@ -283,6 +292,11 @@ class RiskView
             $this->button('🔍 详情', "r:cr:{$user->id}"),
         ]];
         if ($event) {
+            $finding = [];
+            if ($event->event_type === 'sub_limit' && $this->limitedToday($user)) {
+                $finding[] = $this->button('✅ 今天放行', "r:t:a:{$user->id}:{$eventId}");
+            }
+            if ($finding) $rows[] = $finding;
             $risk = new RiskService();
             $allowable = $risk->allowRangeFor((string)$event->ip) !== null && !$risk->allowEntryFor((string)$event->ip);
             $second = [];
@@ -391,6 +405,23 @@ class RiskView
         return $this->code($this->time($row->last_seen_at, 'm-d H:i')) . ' \\| ' . $ip . ' \\| ' .
             $this->code($ua === '' ? '空 UA' : $this->shorten($ua, 40)) . ' \\| x' . (int)$row->occurrences .
             ($result ? ' · ' . $this->escape($result) : '');
+    }
+
+    private function todayLine(User $user): string
+    {
+        $access = new RiskAccessService();
+        $limit = $access->dailyLimit();
+        return $access->subscriptionsToday($user) . ' 次' . ($limit ? "（上限 {$limit}）" : '') .
+            ($access->exempt($user) ? ' · 今天已放行' : '') . ($this->limitedToday($user) ? ' · ⛔ 已超限' : '');
+    }
+
+    /**
+     * Whether the user's subscriptions are refused for the rest of today: over the limit, not isolated, not let through.
+     */
+    private function limitedToday(User $user): bool
+    {
+        $access = new RiskAccessService();
+        return $access->overLimit($user, $access->subscriptionsToday($user));
     }
 
     /**
