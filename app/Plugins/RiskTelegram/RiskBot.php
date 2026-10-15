@@ -283,7 +283,8 @@ class RiskBot
             $this->askToConfirm($context, "确认放行 {$range}", "r:W:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
             $context->alert = true;
             return '放行 ' . $range . ($range !== $ip ? '（这个 IPv6 地址所在的 /64）' : '') .
-                "：之后它命中 IP、ASN 名单不再告警，UA、邮箱名单照常。\n最近 30 天的风险事件里有 {$users} 个用户用过这个 IP，人数多时可能是 CDN 或代理的地址。";
+                "：之后它命中 IP、ASN 名单不再告警，UA、邮箱名单照常。\n最近 30 天有 {$users} 个用户用过这个 IP，" .
+                '人数多时可能是 CDN、代理或公司、学校的出口。';
         }
         $service->addIndicator('allow_ip', $range, $user ? "来自告警（uid {$user->id}）" : '来自告警', $disabled);
         $line = "🟢 {$range} 已加入 IP 白名单" . ($disabled ? '，停用了 IP 名单 ' . implode('、', $disabled) : '');

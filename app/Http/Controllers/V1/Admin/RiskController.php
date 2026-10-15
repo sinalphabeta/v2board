@@ -5,12 +5,14 @@ namespace App\Http\Controllers\V1\Admin;
 use App\Exceptions\RiskIpAllowlistedException;
 use App\Http\Controllers\Controller;
 use App\Models\Plan;
+use App\Models\RiskAccess;
 use App\Models\RiskAudit;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\ServerGroup;
 use App\Models\User;
 use App\Services\IpInfoService;
+use App\Services\RiskAccessService;
 use App\Services\RiskService;
 use App\Services\RiskSettings;
 use Illuminate\Http\Request;
@@ -102,6 +104,21 @@ class RiskController extends Controller
             }
             if ($invalid) abort(500, '可信代理里这些不是 IP 或 CIDR：' . implode('、', $invalid));
             $values['trusted_proxies'] = implode(',', array_unique($proxies));
+        }
+        foreach (['access_log_enabled'] as $name) {
+            if (!$request->has($name)) continue;
+            $enabled = (string)$request->input($name);
+            if (!in_array($enabled, ['0', '1'], true)) abort(500, '参数错误');
+            $values[$name] = $enabled === '1';
+        }
+        $ranges = [
+            'access_log_days' => [7, 365, '访问记录保留天数应该是 7 到 365 之间的整数'],
+        ];
+        foreach ($ranges as $name => [$min, $max, $error]) {
+            if (!$request->has($name)) continue;
+            $value = trim((string)$request->input($name));
+            if (!ctype_digit($value) || (int)$value < $min || (int)$value > $max) abort(500, $error);
+            $values[$name] = (int)$value;
         }
         $service = $this->riskService($request);
         foreach (RiskSettings::save($values) as $name => [$old, $new]) $service->auditSetting($name, $old, $new);
@@ -296,6 +313,86 @@ class RiskController extends Controller
         });
     }
 
+    /**
+     * The access log, the latest first. It takes a date range (date_from / date_to as Y-m-d, both default today):
+     * at most 31 days, or up to the access log's days with a user (user_id, keyword) or an IP (an IPv6 address matches
+     * its /64). Pages of at most 100 rows: the query runs on webman, alongside the subscriptions.
+     */
+    public function accessFetch(Request $request)
+    {
+        $access = new RiskAccessService();
+        $today = $access->day(time());
+        $from = $this->date($request->input('date_from')) ?? $today;
+        $to = $this->date($request->input('date_to')) ?? $today;
+        if ($from > $to) [$from, $to] = [$to, $from];
+        $query = RiskAccess::where('record_at', '>=', $from)->where('record_at', '<=', $to);
+        $narrowed = false;
+        if ($request->input('user_id')) {
+            $query->where('user_id', (int)$request->input('user_id'));
+            $narrowed = true;
+        }
+        $keyword = $this->keyword($request);
+        if ($keyword !== null) {
+            $query->whereIn('user_id', User::where('email', 'like', $keyword)->select('id'));
+            $narrowed = true;
+        }
+        $ip = trim((string)$request->input('ip', ''));
+        if ($ip !== '') {
+            if (!filter_var($ip, FILTER_VALIDATE_IP)) abort(500, 'IP 格式有误');
+            $query->where('ip_net', $access->ipNet($ip));
+            $narrowed = true;
+        }
+        $maxDays = $narrowed ? max(31, (int)RiskSettings::get('access_log_days')) : 31;
+        if (($to - $from) / 86400 + 1 > $maxDays) {
+            abort(500, $narrowed ? "日期范围最多 {$maxDays} 天" : '没有选用户或 IP 时，日期范围最多 31 天');
+        }
+        foreach (['event_type' => RiskAccessService::TYPES, 'result' => RiskAccessService::RESULTS] as $field => $codes) {
+            $value = $request->input($field);
+            if ($value === null || $value === '') continue;
+            if (!is_string($value) || !isset($codes[$value])) abort(500, $field === 'result' ? '结果有误' : '类型有误');
+            $query->where($field, $codes[$value]);
+        }
+        $query->orderByDesc('record_at')->orderByDesc('last_seen_at');
+        return $this->paged($request, $query, function ($rows) use ($access) {
+            $users = User::whereIn('id', $rows->pluck('user_id')->unique()->values())->get(['id', 'email', 'risk_status'])->keyBy('id');
+            $info = (new IpInfoService())->lookupMany($rows->pluck('ip')->unique()->values()->all());
+            $nodes = $access->nodeNets();
+            $types = array_flip(RiskAccessService::TYPES);
+            $results = array_flip(RiskAccessService::RESULTS);
+            return $rows->map(function (RiskAccess $row) use ($users, $info, $nodes, $types, $results) {
+                $user = $users->get($row->user_id);
+                return [
+                    // The primary key, for the table's row key
+                    'key' => implode('|', [$row->record_at, $row->user_id, $row->event_type, $row->result, $row->ip_net, $row->ua_hash]),
+                    'record_at' => $row->record_at,
+                    'user_id' => $row->user_id,
+                    'email' => $user ? $user->email : null,
+                    'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
+                    'event_type' => $types[$row->event_type] ?? null,
+                    'result' => $results[$row->result] ?? null,
+                    'ip' => $row->ip,
+                    'ip_net' => $row->ip_net,
+                    // A node's exit IP: the user updated their subscription through a node
+                    'ip_node' => $row->ip_net !== '' && isset($nodes[$row->ip_net]),
+                    // The row that takes a user's new IP and user agent combinations after many subscriptions in a day
+                    'overflow' => $row->ip_net === '',
+                    'user_agent' => $row->user_agent,
+                    'occurrences' => $row->occurrences,
+                    'first_seen_at' => $row->first_seen_at,
+                    'last_seen_at' => $row->last_seen_at,
+                ] + $this->ipInfoFields($info[$row->ip] ?? null);
+            })->values();
+        }, 100);
+    }
+
+    /**
+     * Today's numbers of the access log, its size, and the last write error.
+     */
+    public function accessStats()
+    {
+        return response(['data' => (new RiskAccessService())->stats()]);
+    }
+
     public function auditFetch(Request $request)
     {
         $query = RiskAudit::query();
@@ -320,10 +417,10 @@ class RiskController extends Controller
         });
     }
 
-    private function paged(Request $request, $query, ?callable $map = null)
+    private function paged(Request $request, $query, ?callable $map = null, int $maxPageSize = 500)
     {
         $current = max(1, (int)$request->input('current', 1));
-        $pageSize = min(500, max(10, (int)$request->input('pageSize', 10)));
+        $pageSize = min($maxPageSize, max(10, (int)$request->input('pageSize', 10)));
         $total = (clone $query)->count();
         $rows = $query->forPage($current, $pageSize)->get();
         return response(['data' => $map ? $map($rows) : $rows, 'total' => $total]);
@@ -341,6 +438,16 @@ class RiskController extends Controller
             'ip_asn' => $info['asn_number'] ?? null,
             'ip_asn_name' => $info['asn_name'] ?? null,
         ];
+    }
+
+    /**
+     * The 0:00 of a Y-m-d date, or null without a valid one.
+     */
+    private function date($value): ?int
+    {
+        if (!is_string($value) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) return null;
+        $date = \DateTime::createFromFormat('!Y-m-d', $value);
+        return $date && $date->format('Y-m-d') === $value ? $date->getTimestamp() : null;
     }
 
     private function validType($type): bool

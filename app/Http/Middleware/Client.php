@@ -73,7 +73,7 @@ class Client
         $request->merge([
             'user' => $user
         ]);
-        (new RiskService())->observe($user, 'subscription', $request, false);
+        (new RiskService())->observeClient($user, $request);
         return $next($request);
     }
 }

@@ -24,7 +24,14 @@ class Search extends RiskCommand
             $bot->reply($message, '用法: /search 邮箱、uid 或 IP（也可以回复一条告警或用户卡片）');
             return;
         }
-        $users = (new RiskService())->findUsers($query);
-        $bot->replyView($message, $users->count() === 1 ? $bot->view()->userCard($users->first()) : $bot->view()->searchResults($users, $query));
+        $service = new RiskService();
+        $users = $service->findUsers($query);
+        if ($users->count() === 1) {
+            $bot->replyView($message, $bot->view()->userCard($users->first()));
+            return;
+        }
+        // For an IP, what each of its users did from it
+        $usage = filter_var($query, FILTER_VALIDATE_IP) ? ($service->ipUsage([$query], $service->searchDays())[$query] ?? []) : [];
+        $bot->replyView($message, $bot->view()->searchResults($users, $query, $usage));
     }
 }

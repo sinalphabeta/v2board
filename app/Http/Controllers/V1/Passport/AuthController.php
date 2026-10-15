@@ -171,6 +171,7 @@ class AuthController extends Controller
                     60 * (int)config('v2board.password_limit_expire', 60)
                 );
             }
+            $riskService->recordAccess($user, 'login', $request, 'failed');
             abort(500, __('Incorrect email or password'));
         }
 

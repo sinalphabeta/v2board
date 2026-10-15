@@ -22,6 +22,9 @@ class RiskSettings
         'ip_info_enabled' => true,
         'asn_cache_ttl' => 3600,
         'trusted_proxies' => '',
+        // The access log and what is built on it (RiskAccessService); these have no .env fallback
+        'access_log_enabled' => true,
+        'access_log_days' => 90,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;
@@ -57,13 +60,16 @@ class RiskSettings
     }
 
     /**
-     * Where each setting comes from: 'panel' (saved on the admin panel) or 'env'.
+     * Where each setting comes from: 'panel' (saved on the admin panel), 'env' (config/risk.php, from .env) or
+     * 'default' (never saved and without an .env fallback).
      */
     public static function sources(): array
     {
         $saved = self::saved();
         $sources = [];
-        foreach (array_keys(self::DEFAULTS) as $name) $sources[$name] = array_key_exists($name, $saved) ? 'panel' : 'env';
+        foreach (array_keys(self::DEFAULTS) as $name) {
+            $sources[$name] = array_key_exists($name, $saved) ? 'panel' : (config()->has("risk.{$name}") ? 'env' : 'default');
+        }
         return $sources;
     }
 

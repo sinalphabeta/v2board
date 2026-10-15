@@ -45,6 +45,9 @@ through `RiskService`. Read the code before changing it:
   matching and events (`observe()` from login, register and subscription), alerts (`SendRiskTelegramJob`), isolation
   (an email indicator), adding and changing indicators (`addIndicators()`; `saveIndicatorChecked()` keeps the IP list
   and the allowlist apart) and the audit log (`v2_risk_audit`; `changes.reason` explains changes made along the way).
+- `app/Services/RiskAccessService.php`: the access log `v2_risk_access` (every login, registration, subscription and
+  order, one row per day, user, type, result, IP and user agent; an IPv6 address by its /64) and the nodes' exit IPs
+  (remembered by the node APIs).
 - `app/Services/RiskSettings.php`: settings in `v2_risk_setting`, falling back to `.env` (`config/risk.php`);
   cached in Redis for 60 s and in each process for 3 s, `fresh()` for the admin pages.
 - `app/Services/IpInfoService.php`: the qqwry and DB-IP city / ASN databases (`risk:geoip-update`); `lookup()` for

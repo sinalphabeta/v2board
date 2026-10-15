@@ -37,11 +37,18 @@ class RiskService
     public const ALLOW_IP_FORMAT = 'IP 白名单只接受 IP，或不大于 /16（IPv6 /48）的网段，也不能是 0.0.0.0 或 ::';
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
     private $ipInfoService;
+    private $access;
     private $actor = ['type' => 'system', 'id' => null, 'ip' => null];
 
     public function __construct(?IpInfoService $ipInfoService = null)
     {
         $this->ipInfoService = $ipInfoService ?: app(IpInfoService::class);
+    }
+
+    public function access(): RiskAccessService
+    {
+        if (!$this->access) $this->access = new RiskAccessService($this);
+        return $this->access;
     }
 
     /**
@@ -152,20 +159,57 @@ class RiskService
     }
 
     /**
-     * How many users each of these IPs had in the last 30 days of risk events, as [ip => count]; IPs without any are
-     * left out. Only risk events are recorded, so for an IP that hits the IP or ASN rules these are all its users.
+     * How many users each of these IPs had in the last 30 days (an IPv6 address counts its /64), as [ip => count];
+     * IPs without any are left out.
      */
     public function recentUserCounts(array $ips): array
     {
-        $ips = array_values(array_unique(array_filter($ips, 'strlen')));
-        if (!$ips) return [];
-        return RiskEvent::whereIn('ip', $ips)->whereNotNull('user_id')->where('last_seen_at', '>=', time() - 30 * 86400)
-            ->selectRaw('ip, COUNT(DISTINCT user_id) AS users')->groupBy('ip')->pluck('users', 'ip')
-            ->map(function ($users) { return (int)$users; })->all();
+        $counts = [];
+        foreach ($this->ipUsage($ips, 30) as $ip => $users) if ($users) $counts[$ip] = count($users);
+        return $counts;
     }
 
     /**
-     * Users matching a uid, an email, or an IP recorded in their risk events (the newest first).
+     * Who used these IPs in the last $days days, by IP as given: [ip => [user_id => [type => times…,
+     * 'last_seen_at' => time]]] with the types subscription, login, register and order. From the access log (an IPv6
+     * address by its /64; a /64 may also be given as such) and the risk events, which go back to before the access log
+     * began; a request in both is counted once.
+     */
+    public function ipUsage(array $ips, int $days): array
+    {
+        $ips = array_values(array_unique(array_filter(array_map('strval', $ips), 'strlen')));
+        if (!$ips) return [];
+        $access = $this->access();
+        $usage = $access->usage($ips, $days);
+        $nets = [];
+        foreach ($ips as $ip) $nets[$ip] = strpos($ip, '/') !== false ? $ip : $access->ipNet($ip);
+        $exact = array_values(array_filter($ips, function ($ip) { return strpos($ip, ':') === false && strpos($ip, '/') === false; }));
+        $ipv6 = count($exact) < count($ips);
+        if (!$exact && !$ipv6) return $usage;
+        $events = RiskEvent::whereNotNull('user_id')->where('last_seen_at', '>=', time() - $days * 86400)
+            ->whereIn('event_type', ['subscription', 'login', 'register'])
+            ->where(function ($query) use ($exact, $ipv6) {
+                if ($exact) $query->whereIn('ip', $exact);
+                // An IPv6 event matches by its /64, which its text does not show: check them all
+                if ($ipv6) $query->orWhere('ip', 'like', '%:%');
+            })->get(['ip', 'user_id', 'event_type', 'occurrences', 'last_seen_at']);
+        foreach ($events as $event) {
+            $net = $access->ipNet((string)$event->ip);
+            foreach ($nets as $ip => $want) {
+                if ($want !== $net) continue;
+                $entry = $usage[$ip][(int)$event->user_id] ?? [];
+                // An isolated user's requests are both logged and risk events: take the larger count, not the sum
+                $entry[$event->event_type] = max((int)($entry[$event->event_type] ?? 0), (int)$event->occurrences);
+                $entry['last_seen_at'] = max((int)($entry['last_seen_at'] ?? 0), (int)$event->last_seen_at);
+                $usage[$ip][(int)$event->user_id] = $entry;
+            }
+        }
+        return $usage;
+    }
+
+    /**
+     * Users matching a uid, an email, or an IP they used within the access log's days (see ipUsage(); the latest
+     * first).
      */
     public function findUsers(string $query, int $limit = 10)
     {
@@ -173,12 +217,21 @@ class RiskService
         if ($query === '') return collect();
         if (ctype_digit($query)) return User::where('id', (int)$query)->get();
         if (filter_var($query, FILTER_VALIDATE_IP)) {
-            $ids = RiskEvent::where('ip', $query)->whereNotNull('user_id')->orderByDesc('last_seen_at')
-                ->limit(200)->pluck('user_id')->unique()->take($limit)->values();
+            $usage = $this->ipUsage([$query], $this->searchDays())[$query] ?? [];
+            uasort($usage, function ($a, $b) { return ($b['last_seen_at'] ?? 0) <=> ($a['last_seen_at'] ?? 0); });
+            $ids = array_slice(array_keys($usage), 0, $limit);
             $users = User::whereIn('id', $ids)->get()->keyBy('id');
-            return $ids->map(function ($id) use ($users) { return $users->get($id); })->filter()->values();
+            return collect($ids)->map(function ($id) use ($users) { return $users->get($id); })->filter()->values();
         }
         return User::where('email', $this->normalizeEmail($query))->get();
+    }
+
+    /**
+     * How far back /search looks for an IP: the access log's days (the risk events are kept 90 days).
+     */
+    public function searchDays(): int
+    {
+        return max(1, (int)RiskSettings::get('access_log_days'));
     }
 
     public function clientIp(Request $request): string
@@ -262,7 +315,11 @@ class RiskService
         return $user;
     }
 
-    public function observe(User $user, string $eventType, Request $request, bool $allowMark = false): array
+    /**
+     * Check a request against the indicators (an email match isolates the user if $allowMark) and record it: as a
+     * risk event when it matches or the user is isolated, and in the access log as $result, unless that is null.
+     */
+    public function observe(User $user, string $eventType, Request $request, bool $allowMark = false, ?string $result = 'ok', int $count = 0): array
     {
         $ip = $this->clientIp($request);
         $ua = (string)$request->header('User-Agent', '');
@@ -271,7 +328,37 @@ class RiskService
         if ($matches || (int)$user->risk_status) {
             $this->recordEvent($user, $eventType, $request, $matches);
         }
+        if ($result !== null) {
+            if ($eventType === 'register' && (int)$user->risk_status === self::STATUS_RISK) $result = 'isolated';
+            $this->access()->record($user, $eventType, $request, $result, $count);
+        }
         return $matches;
+    }
+
+    /**
+     * Record a request that is not checked against the indicators: a wrong password, an order.
+     */
+    public function recordAccess(User $user, string $type, Request $request, string $result = 'ok'): void
+    {
+        $this->access()->record($user, $type, $request, $result);
+    }
+
+    /**
+     * The client middleware's check once it has the user of a subscription token: observe and log the request.
+     * client/app/getVersion (no nodes) and HEAD requests are observed but neither counted nor logged.
+     */
+    public function observeClient(User $user, Request $request): void
+    {
+        $route = $request->route();
+        if (($route && $route->getActionMethod() === 'getVersion') || $request->isMethod('HEAD')) {
+            $this->observe($user, 'subscription', $request, false, null);
+            return;
+        }
+        $count = $this->access()->countSubscription($user);
+        if ((int)$user->risk_status === self::STATUS_RISK) $result = 'isolated';
+        elseif (!(new UserService())->isAvailable($user)) $result = 'unavailable';
+        else $result = 'ok';
+        $this->observe($user, 'subscription', $request, false, $result, $count);
     }
 
     public function recordEvent(?User $user, string $eventType, ?Request $request, array $matches = []): void
@@ -654,7 +741,7 @@ class RiskService
      * Replace invalid UTF-8 and control characters, then cut by characters: a cut by bytes can split a multibyte
      * character, which MySQL (strict mode) and Telegram reject.
      */
-    private function cleanUserAgent($ua, int $length): string
+    public function cleanUserAgent($ua, int $length): string
     {
         $ua = preg_replace('/[\x00-\x1F\x7F]+/', ' ', mb_scrub((string)$ua, 'UTF-8'));
         return mb_substr((string)$ua, 0, $length, 'UTF-8');

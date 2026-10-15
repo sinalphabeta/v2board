@@ -12,6 +12,7 @@ use App\Services\CouponService;
 use App\Services\OrderService;
 use App\Services\PaymentService;
 use App\Services\PlanService;
+use App\Services\RiskService;
 use App\Services\UserService;
 use App\Utils\Helper;
 use Illuminate\Http\Request;
@@ -106,7 +107,8 @@ class OrderController extends Controller
             }
     
             DB::commit();
-    
+            (new RiskService())->recordAccess($user, 'order', $request);
+
             return response([
                 'data' => $order->trade_no
             ]);
@@ -198,6 +200,7 @@ class OrderController extends Controller
         }
 
         DB::commit();
+        (new RiskService())->recordAccess($user, 'order', $request);
 
         return response([
             'data' => $order->trade_no

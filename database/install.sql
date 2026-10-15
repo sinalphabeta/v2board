@@ -637,5 +637,22 @@ CREATE TABLE `v2_risk_setting` (
   PRIMARY KEY (`name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE `v2_risk_access` (
+  `record_at` int(11) NOT NULL,
+  `user_id` int(11) NOT NULL,
+  `event_type` tinyint(4) NOT NULL,
+  `result` tinyint(4) NOT NULL,
+  `ip_net` varchar(45) NOT NULL,
+  `ua_hash` int(10) unsigned NOT NULL,
+  `ip` varchar(45) NOT NULL,
+  `user_agent` varchar(512) NOT NULL,
+  `occurrences` int(10) unsigned NOT NULL DEFAULT '1',
+  `first_seen_at` int(11) NOT NULL,
+  `last_seen_at` int(11) NOT NULL,
+  PRIMARY KEY (`record_at`,`user_id`,`event_type`,`result`,`ip_net`,`ua_hash`),
+  KEY `risk_access_user` (`user_id`,`record_at`),
+  KEY `risk_access_net` (`ip_net`,`record_at`,`user_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 
 -- 2025-09-12 10:05:00

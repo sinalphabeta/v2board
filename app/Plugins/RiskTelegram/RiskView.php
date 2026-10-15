@@ -3,12 +3,14 @@
 namespace App\Plugins\RiskTelegram;
 
 use App\Models\Plan;
+use App\Models\RiskAccess;
 use App\Models\RiskAudit;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\ServerGroup;
 use App\Models\User;
 use App\Services\IpInfoService;
+use App\Services\RiskAccessService;
 use App\Services\RiskService;
 use App\Services\RiskSettings;
 
@@ -18,7 +20,7 @@ use App\Services\RiskSettings;
  * Button callback data, at most 64 bytes:
  *   r:m  menu · r:u:<page> isolated users · r:e:<page> recent events · r:l:<type>:<page> indicators
  *   r:a:<page> audit log · r:h status · r:c:<uid> user card · r:cr:<uid> user card as a new reply
- *   r:ue:<uid>:<s|l>:<page> a user's subscriptions or logins
+ *   r:ue:<uid>:<s|l|o>:<page> a user's subscriptions, logins or orders (the access log)
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
  *   r:p:<eid> ask to list the event's IP, r:P:<eid> do it · r:k:<eid> mark the alert handled
  *   r:w:<eid> ask to allowlist the event's IP, r:W:<eid> do it
@@ -32,11 +34,16 @@ class RiskView
     public const SETTINGS = [
         'bot_token' => 'Bot Token', 'alert_chat_id' => '告警群 Chat ID', 'honeypot_group_id' => '蜜罐权限组',
         'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
+        'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数',
     ];
+    // How an access log row's result shows, when it is not ok
+    private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用'];
     private const FIELDS = ['value' => '值', 'note' => '备注', 'enabled' => '启用'];
     // Audit changes that the action itself already says
     private const IMPLIED = ['add' => ['value', 'enabled'], 'delete' => ['enabled']];
     private const PAGE_SIZE = 10;
+    // The nodes' exit IPs, read once per view
+    private $nodes;
 
     public function menu(): array
     {
@@ -128,10 +135,23 @@ class RiskView
             '24 小时事件：' . RiskEvent::where('last_seen_at', '>=', time() - 86400)->count(),
             'ASN 数据库：' . ($asnAvailable ? '可用' : '不可用'),
         ];
+        $stats = $risk->access()->stats();
+        $lines[] = '';
+        $lines[] = '访问记录：' . ($stats['enabled'] ? '开' : '⚠️ 已关闭') . $this->escape(' · 保留 ' . $stats['days'] . ' 天 · ' .
+            $this->tableSize($stats['table_rows'], $stats['table_bytes']));
+        $lines[] = '今天：' . $this->escape($stats['rows_today'] . ' 行 · 最后写入 ' . $this->time($stats['last_write_at'], 'H:i:s') .
+            ' · 非公网 IP ' . $this->percent($stats['private_rows_today'], $stats['rows_today']));
+        $lastError = $stats['last_error'];
+        $lines[] = '写入失败：今天 ' . $stats['errors_today'] . ' 次' . ($lastError ? $this->escape('，最近一次 ' .
+            $this->time($lastError['at'] ?? null, 'm-d H:i')) . ' ' . $this->code($this->shorten($lastError['message'] ?? '', 80)) : '');
+        $lines[] = '节点出口 IP：' . $stats['nodes'] . $this->escape(' 个（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）');
         $mixed = $risk->mixedHoneypotNodes();
         if ($mixed) $lines[] = "\n⚠️ 这些节点同时属于蜜罐组和普通组：" . $this->escape(implode(', ', $mixed));
         if ($honeypot > 0 && !$group) $lines[] = "\n⚠️ 蜜罐权限组不存在：被隔离的用户拿不到任何节点";
         if ($counts['asn'] && !$asnAvailable) $lines[] = "\n⚠️ 有 ASN 名单但 ASN 数据库不可用";
+        if ($stats['rows_today'] >= 20 && $stats['private_rows_today'] * 2 > $stats['rows_today']) {
+            $lines[] = "\n⚠️ 今天的访问记录大多是内网 IP：可信代理可能没配好，记下的是反代的地址";
+        }
         return $this->view(implode("\n", $lines), [[$this->button('🏠 菜单', 'r:m')]]);
     }
 
@@ -185,13 +205,17 @@ class RiskView
             '到期时间: ' . $this->escape($user->expired_at === null ? '长期有效' : date('Y-m-d H:i:s', (int)$user->expired_at)),
             '权限组: ' . $this->escape($user->group_id ?? '-'),
             '风险状态: ' . $this->riskStatus($user),
+        ];
+        $registration = (new RiskAccessService())->registration($user);
+        if ($registration) $lines[] = '注册 IP: ' . $this->code($registration->ip);
+        $lines = array_merge($lines, [
             '',
             '*最近订阅*',
-            $this->eventLines($user, 'subscription', 5),
+            $this->accessLines($user, 'subscription', 5),
             '',
             '*最近登录*',
-            $this->eventLines($user, 'login', 5),
-        ];
+            $this->accessLines($user, 'login', 5),
+        ]);
         return $this->view(implode("\n", $lines), $this->cardKeyboard($user));
     }
 
@@ -199,34 +223,46 @@ class RiskView
     {
         return [
             [$this->isolated($user) ? $this->button('🔓 解除隔离', "r:r:c:{$user->id}") : $this->button('🔒 隔离', "r:i:c:{$user->id}")],
-            [$this->button('📜 订阅记录', "r:ue:{$user->id}:s:1"), $this->button('🔑 登录记录', "r:ue:{$user->id}:l:1")],
+            [
+                $this->button('📜 订阅记录', "r:ue:{$user->id}:s:1"), $this->button('🔑 登录记录', "r:ue:{$user->id}:l:1"),
+                $this->button('🛒 下单记录', "r:ue:{$user->id}:o:1"),
+            ],
             [$this->button('🏠 菜单', 'r:m')],
         ];
     }
 
+    /**
+     * A user's subscriptions ('s'), logins ('l') or orders ('o') from the access log, one row per day, IP and client.
+     */
     public function userEvents(User $user, string $kind, int $page): array
     {
-        $type = $kind === 'l' ? 'login' : 'subscription';
-        $query = RiskEvent::where('user_id', $user->id)->where('event_type', $type)->orderByDesc('last_seen_at')->orderByDesc('id');
-        [$events, $page, $pages, $total] = $this->paginate($query, $page);
-        $text = ($kind === 'l' ? '🔑 *登录记录*' : '📜 *订阅记录*') . ' ' . $this->code($user->email) .
-            "\n共 {$total} 条 · 第 {$page}/{$pages} 页\n时间 \\| IP \\| UA \\| 次数\n\n" .
-            ($events->count() ? $events->map(function (RiskEvent $event) { return $this->eventLine($event); })->implode("\n") : '暂无');
+        $kinds = ['s' => ['subscription', '📜 *订阅记录*'], 'l' => ['login', '🔑 *登录记录*'], 'o' => ['order', '🛒 *下单记录*']];
+        [$type, $title] = $kinds[$kind] ?? $kinds['s'];
+        [$rows, $page, $pages, $total] = (new RiskAccessService())->userPage($user, $type, $page, self::PAGE_SIZE);
+        $text = $title . ' ' . $this->code($user->email) . "\n共 {$total} 条 · 第 {$page}/{$pages} 页\n" .
+            $this->escape('最后一次 | IP | 客户端 | 当天次数') . "\n\n" .
+            ($rows->count() ? $rows->map(function (RiskAccess $row) { return $this->accessLine($row); })->implode("\n") : '暂无');
         $pager = $this->pager("r:ue:{$user->id}:{$kind}:", $page, $pages);
         $pager[array_search('r:m', array_column($pager, 'callback_data'), true)] = $this->button('👤 返回用户', "r:c:{$user->id}");
         return $this->view($text, [$pager]);
     }
 
-    public function searchResults($users, string $query): array
+    /**
+     * Users found for a query; for an IP with what each did from it ($usage: see RiskService::ipUsage()).
+     */
+    public function searchResults($users, string $query, array $usage = []): array
     {
         $byIp = (bool)filter_var($query, FILTER_VALIDATE_IP);
-        $note = $byIp ? "\n" . $this->escape('只查得到记录过风险事件的用户') : '';
+        $days = (new RiskService())->searchDays();
+        $note = $byIp ? "\n" . $this->escape("最近 {$days} 天" . (strpos($query, ':') !== false ? '，IPv6 按它所在的 /64 查' : '')) : '';
         if (!$users->count()) return $this->view('未找到：' . $this->code($query) . $note, []);
         $lines = [];
         $buttons = [];
         foreach ($users->values() as $i => $user) {
-            $lines[] = ($i + 1) . '\\. ' . $this->code($user->email) . ' · uid ' . $this->code($user->id) .
+            $line = ($i + 1) . '\\. ' . $this->code($user->email) . ' · uid ' . $this->code($user->id) .
                 ($this->isolated($user) ? ' · 🔒 已隔离' : '');
+            if (isset($usage[$user->id])) $line .= "\n" . $this->escape('   ' . $this->usageText($usage[$user->id]));
+            $lines[] = $line;
             $buttons[] = [$this->button(($i + 1) . '. ' . $this->shorten($user->email, 40), "r:c:{$user->id}")];
         }
         $text = '🔎 *查询* ' . $this->code($query) . "\n共 {$users->count()} 个用户" . $note . "\n\n" . implode("\n", $lines);
@@ -333,18 +369,53 @@ class RiskView
             ($indicator ? '，名单 ' . $this->code($indicator->value) : '') . '）';
     }
 
-    private function eventLines(User $user, string $type, int $limit): string
+    private function accessLines(User $user, string $type, int $limit): string
     {
-        $events = RiskEvent::where('user_id', $user->id)->where('event_type', $type)
-            ->orderByDesc('last_seen_at')->orderByDesc('id')->limit($limit)->get();
-        return $events->count() ? $events->map(function (RiskEvent $event) { return $this->eventLine($event); })->implode("\n") : '无记录';
+        [$rows] = (new RiskAccessService())->userPage($user, $type, 1, $limit);
+        return $rows->count() ? $rows->map(function (RiskAccess $row) { return $this->accessLine($row); })->implode("\n") : '无记录';
     }
 
-    private function eventLine(RiskEvent $event): string
+    /**
+     * An access log row: its last time, the IP (节点: a node's exit IP), the client, how many times that day, and the
+     * result unless ok (e.g. 密码错误).
+     */
+    private function accessLine(RiskAccess $row): string
     {
-        $ua = preg_replace('/\s+/', ' ', (string)$event->user_agent);
-        return $this->code($this->time($event->last_seen_at, 'm-d H:i:s')) . ' \\| ' . $this->code($event->ip) . ' \\| ' .
-            $this->code($this->shorten($ua, 60)) . ' \\| x' . (int)$event->occurrences;
+        if ($this->nodes === null) $this->nodes = (new RiskAccessService())->nodeNets();
+        $nodes = $this->nodes;
+        $ua = trim(preg_replace('/\s+/', ' ', (string)$row->user_agent));
+        $results = array_flip(RiskAccessService::RESULTS);
+        $result = self::ACCESS_RESULTS[$results[$row->result] ?? 'ok'] ?? null;
+        $ip = $this->code($row->ip) . ($row->ip_net === '' ? ' ' . $this->escape('（当天请求太多，之后的都合在这一行）') : '') .
+            ($row->ip_net !== '' && isset($nodes[$row->ip_net]) ? ' 节点' : '');
+        return $this->code($this->time($row->last_seen_at, 'm-d H:i')) . ' \\| ' . $ip . ' \\| ' .
+            $this->code($ua === '' ? '空 UA' : $this->shorten($ua, 40)) . ' \\| x' . (int)$row->occurrences .
+            ($result ? ' · ' . $this->escape($result) : '');
+    }
+
+    /**
+     * What a user did from an IP, e.g. 订阅 20 次 · 登录 1 次 · 最后 10-15 12:30.
+     */
+    private function usageText(array $usage): string
+    {
+        $parts = [];
+        foreach (RiskAccessService::TYPE_NAMES as $type => $name) {
+            if (!empty($usage[$type])) $parts[] = "{$name} {$usage[$type]} 次";
+        }
+        if (!empty($usage['last_seen_at'])) $parts[] = '最后 ' . $this->time($usage['last_seen_at']);
+        return implode(' · ', $parts);
+    }
+
+    private function tableSize(?int $rows, ?int $bytes): string
+    {
+        if ($rows === null || $bytes === null) return '大小未知';
+        $size = $bytes < 1048576 ? max(1, round($bytes / 1024)) . ' KB' : number_format($bytes / 1048576, 1) . ' MB';
+        return '约 ' . number_format($rows) . ' 行 / ' . $size;
+    }
+
+    private function percent(int $part, int $total): string
+    {
+        return $total ? round($part * 100 / $total) . '%' : '-';
     }
 
     private function canListIp($ip): bool

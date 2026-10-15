@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\V2\Server;
 
 use App\Http\Controllers\Controller;
+use App\Services\RiskAccessService;
 use App\Services\ServerService;
 use Illuminate\Http\Request;
 use App\Utils\Helper;
@@ -47,6 +48,7 @@ class ServerController extends Controller
             ], 200)->send();
             exit;
         }
+        (new RiskAccessService())->rememberNode($request);
     }
 
     // 后端获取配置
