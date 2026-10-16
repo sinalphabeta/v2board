@@ -174,6 +174,7 @@ class RiskLinkService
             'link_alerts' => RiskEvent::whereIn('event_type', ['ip_users', 'register_link'])
                 ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'skipped_alerts' => $this->risk->skippedAlerts($from),
+            'merged_alerts' => $this->risk->alerts()->dayCounts($from)['merged'],
             'top_subscribers' => $top->map(function ($row) use ($email) {
                 return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'total' => (int)$row->total,
                     'ips' => (int)$row->ips, 'clients' => (int)$row->clients];

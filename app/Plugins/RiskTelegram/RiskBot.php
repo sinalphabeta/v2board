@@ -80,6 +80,8 @@ class RiskBot
             $this->telegram->answerCallbackQuery($id, '无权限');
             return;
         }
+        // Someone is handling this alert: stop updating it and reminding about it (RiskAlertService)
+        (new RiskService())->alerts()->closeMessage((int)$message['chat']['id'], (int)$message['message_id']);
         $context = (object)[
             'chat_id' => (int)$message['chat']['id'],
             'message_id' => (int)$message['message_id'],

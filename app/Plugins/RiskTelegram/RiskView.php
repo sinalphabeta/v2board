@@ -41,6 +41,7 @@ class RiskView
         'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
         'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
         'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
+        'alert_daily_limit' => '每类告警每天上限',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
@@ -154,6 +155,8 @@ class RiskView
         $lines[] = '节点出口 IP：' . $stats['nodes'] . $this->escape(' 个（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）');
         $lines[] = '关联检测：' . (RiskSettings::get('link_detection') ? '开 · 同 IP ' . (int)RiskSettings::get('link_ip_users') . ' 人起报' : '关') .
             ' · 每晚日报：' . (RiskSettings::get('daily_report') ? '开' : '关');
+        $alerts = $risk->alerts()->dayCounts();
+        $lines[] = $this->escape('告警：每类每天最多 ' . $risk->alerts()->dailyLimit() . " 条 · 今天合并 {$alerts['merged']} 条 · 超出上限没发 {$alerts['skipped']} 条");
         $mixed = $risk->mixedHoneypotNodes();
         if ($mixed) $lines[] = "\n⚠️ 这些节点同时属于蜜罐组和普通组：" . $this->escape(implode(', ', $mixed));
         if ($honeypot > 0 && !$group) $lines[] = "\n⚠️ 蜜罐权限组不存在：被隔离的用户拿不到任何节点";
@@ -335,7 +338,8 @@ class RiskView
             $this->escape("活跃 {$data['active']} 人 · 订阅 {$data['subscriptions']} 次 · 登录 {$data['logins']}（密码错误 {$data['failed_logins']}）· " .
                 "注册 {$data['registrations']} · 下单 {$data['orders']} · 支付 {$data['paid']}"),
             $this->escape("风险事件 {$data['events']} 条 · 新隔离 {$data['isolated']} 人 · 订阅超限 {$data['limited']} 人 · " .
-                "关联告警 {$data['link_alerts']} 条" . ($data['skipped_alerts'] ? "（超出每天上限没发的 {$data['skipped_alerts']} 条）" : '')),
+                "关联告警 {$data['link_alerts']} 条" . ($data['merged_alerts'] || $data['skipped_alerts']
+                    ? "（合并 {$data['merged_alerts']} 条、超出每天上限没发 {$data['skipped_alerts']} 条）" : '')),
         ];
         $users = [];
         $user = function (array $row) use (&$users): string {

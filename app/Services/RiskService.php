@@ -32,8 +32,6 @@ class RiskService
      * the event's detail.
      */
     public const FINDING_TYPES = ['sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联'];
-    // Alerts of each finding type a day; the rest are only in the daily report
-    public const ALERT_BUDGET = 20;
     /**
      * Indicator types. allow_ip is an allowlist: requests from its IPs skip the IP and ASN rules. The others are
      * risk rules (RULE_TYPES): a match is recorded and alerted, and an email match also isolates the user.
@@ -48,6 +46,7 @@ class RiskService
     private $ipInfoService;
     private $access;
     private $links;
+    private $alerts;
     private $actor = ['type' => 'system', 'id' => null, 'ip' => null];
 
     public function __construct(?IpInfoService $ipInfoService = null)
@@ -65,6 +64,12 @@ class RiskService
     {
         if (!$this->links) $this->links = new RiskLinkService($this);
         return $this->links;
+    }
+
+    public function alerts(): RiskAlertService
+    {
+        if (!$this->alerts) $this->alerts = new RiskAlertService();
+        return $this->alerts;
     }
 
     /**
@@ -419,8 +424,8 @@ class RiskService
 
     /**
      * Record what a check found about a user as a risk event of a FINDING_TYPES type, with $detail as the evidence, and
-     * alert it unless today's alerts of the type have reached ALERT_BUDGET. $key identifies the finding: recording it
-     * again updates the same event (and alerts again unless $alert is false).
+     * alert it (see notify()). $key identifies the finding: recording it again updates the same event (and alerts again
+     * unless $alert is false). 注册关联 alerts are merged by the registration IP (an IPv6 /64).
      */
     public function recordFinding(User $user, string $type, string $ip, string $ua, string $detail, string $key, bool $alert = true): ?RiskEvent
     {
@@ -444,35 +449,19 @@ class RiskService
         } catch (\Throwable $e) {
             return null;
         }
-        if ($alert && $this->withinAlertBudget($type)) $this->notify($user, $type, $ip, $ua, $detail, (int)$event->id);
+        if ($alert) {
+            $subject = $type === 'register_link' ? 'register:' . $this->access()->ipNet($ip) : null;
+            $this->notify($user, $type, $ip, $ua, $detail, (int)$event->id, $subject);
+        }
         return $event;
     }
 
     /**
-     * How many alerts of each finding type were left out today (or on the day of $time) for going over ALERT_BUDGET.
+     * How many alerts were left out today (or on the day of $time) for going over the daily budget of their kind.
      */
     public function skippedAlerts(?int $time = null): int
     {
-        $total = 0;
-        foreach (array_keys(self::FINDING_TYPES) as $type) {
-            try { $total += (int)Cache::get("risk:alert-skipped:{$type}:" . date('Ymd', $time ?? time()), 0); } catch (\Throwable $e) { }
-        }
-        return $total;
-    }
-
-    private function withinAlertBudget(string $type): bool
-    {
-        try {
-            $key = "risk:alert-budget:{$type}:" . date('Ymd');
-            Cache::add($key, 0, 2 * 86400);
-            if ((int)Cache::increment($key) <= self::ALERT_BUDGET) return true;
-            $skipped = "risk:alert-skipped:{$type}:" . date('Ymd');
-            Cache::add($skipped, 0, 2 * 86400);
-            Cache::increment($skipped);
-            return false;
-        } catch (\Throwable $e) {
-            return true;
-        }
+        return $this->alerts()->dayCounts($time)['skipped'];
     }
 
     /**
@@ -551,14 +540,15 @@ class RiskService
         } catch (\Throwable $e) {
             return;
         }
-        if ($count === 1) $this->notify($user, $eventType, $ip, $ua, $matches, (int)$event->id);
+        if ($count === 1) $this->notify($user, $eventType, $ip, $ua, $matches, (int)$event->id, $this->alerts()->requestSubject($user, $ip));
     }
 
     /**
      * Send a risk alert to the alert chat; with a user and an event it carries the risk bot's action buttons.
-     * $matches: the indicators matched, or for a finding (FINDING_TYPES) its detail.
+     * $matches: the indicators matched, or for a finding (FINDING_TYPES) its detail. With a $subject, the alert is merged
+     * into the day's first one about it, and each kind of alert has a daily budget (RiskAlertService).
      */
-    public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = [], ?int $eventId = null): void
+    public function notify(?User $user, string $eventType, string $ip, string $ua, $matches = [], ?int $eventId = null, ?string $subject = null): void
     {
         $ua = $this->cleanUserAgent($ua, 240);
         $chatId = RiskSettings::get('alert_chat_id');
@@ -583,7 +573,15 @@ class RiskService
         $token = (string)RiskSettings::get('bot_token');
         if (!$token) return;
         try {
-            SendRiskTelegramJob::dispatch((int)$chatId, $text, $ip, $user ? (int)$user->id : null, $eventId);
+            $state = $subject !== null ? $this->alerts()->gate($subject, $eventId, $user ? (int)$user->id : null) : 'first';
+            if ($state === 'merged' || $state === 'closed') return;
+            if ($state === 'remind') {
+                $text = $escape('🔔 今天又有 ' . RiskAlertService::REMIND_AT . ' 条合并进了被回复的那条告警，这是最新的一条') . "\n" . $text;
+            } else {
+                $kind = $finding ? $eventType : ($user && (int)$user->risk_status === self::STATUS_RISK ? 'isolated' : 'hit');
+                if (!$this->alerts()->withinBudget($kind, $chatId)) return;
+            }
+            SendRiskTelegramJob::dispatch((int)$chatId, $text, $ip, $user ? (int)$user->id : null, $eventId, $subject, $state === 'remind');
         } catch (\Throwable $e) { /* queue unavailable */ }
     }
 
@@ -768,6 +766,11 @@ class RiskService
         $changes = $this->changes($user, ['risk_status', 'risk_indicator_id']);
         $user->save();
         if ($changes) $this->audit($user->risk_status ? 'mark' : 'unmark', $indicator, $changes, $user);
+        // Isolated from the bot or the admin panel: no more alerts about the user today. One marked by the system (an
+        // email indicator matched at registration or login) still alerts.
+        if (isset($changes['risk_status']) && $user->risk_status && $this->actor['type'] !== 'system') {
+            $this->alerts()->close($this->alerts()->requestSubject($user, ''));
+        }
     }
 
     /**

@@ -29,6 +29,8 @@ class RiskSettings
         'link_detection' => true,
         'link_ip_users' => 3,
         'daily_report' => true,
+        // Alerts of each kind a day (RiskAlertService); the rest are only in the risk events and the daily report
+        'alert_daily_limit' => 20,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;

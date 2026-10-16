@@ -49,6 +49,9 @@ through `RiskService`. Read the code before changing it:
   order, one row per day, user, type, result, IP and user agent; an IPv6 address by its /64), the daily subscription
   limit (`guardClient()` in `RiskService`, called from the client middleware) and the nodes' exit IPs (remembered by
   the node APIs).
+- `app/Services/RiskAlertService.php`: keeps alerts from flooding the alert chat. Alerts about one subject (a user, or
+  an IP) go out once a day, later ones update that message (`EditRiskAlertJob`, every 5 minutes at most); each kind has
+  a daily budget (`alert_daily_limit`); the jobs send at most 15 messages a minute and wait out Telegram's 429.
 - `app/Services/RiskLinkService.php`: links between accounts (checked at registration and by `risk:scan` every 10
   minutes, alerted as risk events with a `detail`, never acted on) and the daily report (`risk:summary`, 00:05).
 - `app/Services/RiskSettings.php`: settings in `v2_risk_setting`, falling back to `.env` (`config/risk.php`);
