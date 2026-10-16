@@ -59,3 +59,9 @@ through `RiskService`. Read the code before changing it:
   command menu after 设置风险 Bot Webhook on the admin panel.
 - `app/Http/Routes/V1/RiskAdminRoute.php` and `app/Http/Controllers/V1/Admin/RiskController.php`: the admin panel's
   `/{secure_path}/risk/*`, kept apart from `AdminRoute` so upstream changes apply cleanly.
+
+## webman
+
+`webman.php` serves on `tcp://127.0.0.1:6600` with `WebmanHttp`, Adapterman's HTTP protocol wrapped so that a body it
+cannot parse (bad JSON, an empty body sent as JSON) is answered with 400: Adapterman parses it before onMessage, and an
+exception there would stop the whole worker.
