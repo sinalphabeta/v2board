@@ -20,7 +20,7 @@ use App\Services\RiskSettings;
  * Button callback data, at most 64 bytes:
  *   r:m  menu · r:u:<page> isolated users · r:e:<page> recent events · r:l:<type>:<page> indicators
  *   r:a:<page> audit log · r:h status · r:d today's report · r:c:<uid> user card · r:cr:<uid> user card as a new reply
- *   r:ue:<uid>:<s|l|o>:<page> a user's subscriptions, logins or orders (the access log)
+ *   r:ue:<uid>:<s|l|o|k>:<page> a user's subscriptions, logins, orders or old links (the access log)
  *   r:n:<ip> the users of an IP, as a new reply (the IP's colons as dashes: the data is split at colons)
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
  *   r:s|t:<ctx>:<uid>:<eid> ask to reset the subscription / let it through today, r:S|T:… do it
@@ -226,6 +226,11 @@ class RiskView
         ];
         $registration = (new RiskAccessService())->registration($user);
         if ($registration) $lines[] = '注册 IP: ' . $this->code($registration->ip);
+        $old = (new RiskAccessService())->oldLinks($user);
+        if ($old) {
+            $lines[] = '重置后旧链接: ' . $this->escape('近 ' . RiskAccessService::OLD_LINK_DAYS . " 天 {$old[0]} 次 · {$old[1]} 个 IP · 最后 " .
+                $this->time($old[2]));
+        }
         $lines = array_merge($lines, [
             '',
             '*最近订阅*',
@@ -248,16 +253,20 @@ class RiskView
             $this->button('📜 订阅记录', "r:ue:{$user->id}:s:1"), $this->button('🔑 登录记录', "r:ue:{$user->id}:l:1"),
             $this->button('🛒 下单记录', "r:ue:{$user->id}:o:1"),
         ];
+        // Clients still updating with a link from before a reset: the user's own, or whoever it was shared with
+        if ((new RiskAccessService())->oldLinks($user)) $rows[] = [$this->button('🔗 旧链接记录', "r:ue:{$user->id}:k:1")];
         $rows[] = [$this->button('🏠 菜单', 'r:m')];
         return $rows;
     }
 
     /**
-     * A user's subscriptions ('s'), logins ('l') or orders ('o') from the access log, one row per day, IP and client.
+     * A user's subscriptions ('s'), logins ('l'), orders ('o') or old links ('k') from the access log, one row per day,
+     * IP and client.
      */
     public function userEvents(User $user, string $kind, int $page): array
     {
-        $kinds = ['s' => ['subscription', '📜 *订阅记录*'], 'l' => ['login', '🔑 *登录记录*'], 'o' => ['order', '🛒 *下单记录*']];
+        $kinds = ['s' => ['subscription', '📜 *订阅记录*'], 'l' => ['login', '🔑 *登录记录*'], 'o' => ['order', '🛒 *下单记录*'],
+            'k' => ['old_link', '🔗 *旧链接记录*']];
         [$type, $title] = $kinds[$kind] ?? $kinds['s'];
         [$rows, $page, $pages, $total] = (new RiskAccessService())->userPage($user, $type, $page, self::PAGE_SIZE);
         $text = $title . ' ' . $this->code($user->email) . "\n共 {$total} 条 · 第 {$page}/{$pages} 页\n" .
@@ -368,6 +377,9 @@ class RiskView
                 $ua = trim($row['user_agent']);
                 return $user($row) . ' ' . $this->code($ua === '' ? '空 UA' : $this->shorten($ua, 32)) . $this->escape(" {$row['total']} 次");
             }, $data['scripts']),
+            '旧链接还在被拉' => array_map(function ($row) use ($user) {
+                return $user($row) . $this->escape(" {$row['total']} 次 · {$row['ips']} 个 IP");
+            }, $data['old_links'] ?? []),
         ];
         foreach ($sections as $name => $rows) {
             if ($rows) $lines[] = "\n*" . $this->escape($name) . "*\n" . implode("\n", $rows);
@@ -474,7 +486,8 @@ class RiskView
         $nodes = $this->nodes;
         $ua = trim(preg_replace('/\s+/', ' ', (string)$row->user_agent));
         $results = array_flip(RiskAccessService::RESULTS);
-        $result = self::ACCESS_RESULTS[$results[$row->result] ?? 'ok'] ?? null;
+        // An old link is always refused: its result says nothing more
+        $result = (int)$row->event_type === RiskAccessService::TYPES['old_link'] ? null : (self::ACCESS_RESULTS[$results[$row->result] ?? 'ok'] ?? null);
         $ip = $this->code($row->ip) . ($row->ip_net === '' ? ' ' . $this->escape('（当天请求太多，之后的都合在这一行）') : '') .
             ($row->ip_net !== '' && isset($nodes[$row->ip_net]) ? ' 节点' : '');
         return $this->code($this->time($row->last_seen_at, 'm-d H:i')) . ' \\| ' . $ip . ' \\| ' .

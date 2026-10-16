@@ -68,6 +68,8 @@ class Client
         }
         $user = User::where('token', $token)->first();
         if (!$user) {
+            // A link from before a reset: logged for its user as old_link (one-time and TOTP links expire by themselves)
+            if ($submethod === 0 && is_string($token)) (new RiskService())->access()->recordOldLink($token, $request);
             abort(403, 'token is error');
         }
         $request->merge([

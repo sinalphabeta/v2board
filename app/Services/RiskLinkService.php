@@ -148,10 +148,14 @@ class RiskLinkService
             })
             ->selectRaw('user_id, user_agent, SUM(occurrences) AS total')->groupBy('user_id', 'user_agent')
             ->orderByDesc('total')->limit(5)->get();
+        // Links from before a reset still updating: the more IPs, the more likely shared
+        $oldLinks = $base()->where('event_type', $types['old_link'])
+            ->selectRaw('user_id, SUM(occurrences) AS total, COUNT(DISTINCT ip_net) AS ips')
+            ->groupBy('user_id')->orderByDesc('ips')->orderByDesc('total')->limit(5)->get();
         $shared = array_slice($this->sharedIps($day), 0, 5);
         $regions = $this->regions($day);
         $ids = $top->pluck('user_id')->merge($failed->pluck('user_id'))->merge($scripts->pluck('user_id'))
-            ->merge(array_column($regions, 'user_id'))->unique()->values();
+            ->merge(array_column($regions, 'user_id'))->merge($oldLinks->pluck('user_id'))->unique()->values();
         $emails = User::whereIn('id', $ids)->pluck('email', 'id');
         $email = function ($id) use ($emails) { return $emails[$id] ?? null; };
         $info = $shared ? (new IpInfoService())->lookupMany(array_column($shared, 'ip')) : [];
@@ -194,6 +198,9 @@ class RiskLinkService
             'scripts' => $scripts->map(function ($row) use ($email) {
                 return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'user_agent' => (string)$row->user_agent,
                     'total' => (int)$row->total];
+            })->all(),
+            'old_links' => $oldLinks->map(function ($row) use ($email) {
+                return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'total' => (int)$row->total, 'ips' => (int)$row->ips];
             })->all(),
             'table_rows' => $stats['table_rows'],
             'table_bytes' => $stats['table_bytes'],

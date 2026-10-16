@@ -10,8 +10,9 @@ use Illuminate\Support\Facades\DB;
 
 /**
  * The access log (v2_risk_access): every login, registration, subscription and order, one row per day (record_at, the
- * day's 0:00), user, type, result, IP and user agent, kept for access_log_days days. Also the daily subscription limit,
- * and the exit IPs of the nodes, which the link checks leave out.
+ * day's 0:00), user, type, result, IP and user agent, kept for access_log_days days; also subscriptions with a link that
+ * a reset replaced (old_link, logged for the user it belonged to). Also the daily subscription limit, and the exit IPs
+ * of the nodes, which the link checks leave out.
  *
  * An IPv6 address is merged by its /64 (ip_net), since clients rotate their addresses; ip keeps the last one seen.
  * Rows are written one statement each, outside any transaction; a write never fails the request: errors are reported at
@@ -19,8 +20,8 @@ use Illuminate\Support\Facades\DB;
  */
 class RiskAccessService
 {
-    public const TYPES = ['subscription' => 1, 'login' => 2, 'register' => 3, 'order' => 4];
-    public const TYPE_NAMES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'order' => '下单'];
+    public const TYPES = ['subscription' => 1, 'login' => 2, 'register' => 3, 'order' => 4, 'old_link' => 5];
+    public const TYPE_NAMES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'order' => '下单', 'old_link' => '旧链接'];
     /**
      * ok; failed: a wrong password; isolated: the honeypot nodes, or isolated on registration; unavailable: banned,
      * expired or without a plan (no nodes); limited: over the daily limit (answered 429)
@@ -30,6 +31,8 @@ class RiskAccessService
     // a client may send a new user agent each time
     public const OVERFLOW_AFTER = 1000;
     public const NODE_DAYS = 7;
+    // How long a subscription token replaced by a reset is still known (old_link)
+    public const OLD_LINK_DAYS = 30;
     private const NODES_KEY = 'risk:node-ips';
     private const ERROR_KEY = 'risk:access:last-error';
     private $risk;
@@ -45,8 +48,8 @@ class RiskAccessService
     }
 
     /**
-     * Record a request as $type ('subscription', 'login', 'register' or 'order') with $result (a key of RESULTS).
-     * $count: the user's subscriptions today, for the overflow row.
+     * Record a request as $type (a key of TYPES) with $result (a key of RESULTS).
+     * $count: the user's subscriptions (or old_link requests) today, for the overflow row.
      */
     public function record(User $user, string $type, Request $request, string $result = 'ok', int $count = 0): void
     {
@@ -55,7 +58,7 @@ class RiskAccessService
             if (!$this->enabled()) return;
             $ip = $this->ip($this->risk()->clientIp($request));
             $ua = $this->risk()->cleanUserAgent($request->header('User-Agent', ''), 512);
-            $overflow = $type === 'subscription' && $count > self::OVERFLOW_AFTER;
+            $overflow = in_array($type, ['subscription', 'old_link'], true) && $count > self::OVERFLOW_AFTER;
             $now = time();
             DB::insert('INSERT INTO `v2_risk_access` (`record_at`, `user_id`, `event_type`, `result`, `ip_net`, `ua_hash`, `ip`,'
                 . ' `user_agent`, `occurrences`, `first_seen_at`, `last_seen_at`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)'
@@ -67,6 +70,46 @@ class RiskAccessService
         } catch (\Throwable $e) {
             $this->failed($e);
         }
+    }
+
+    /**
+     * A reset replaced the user's subscription token: keep the old one for OLD_LINK_DAYS days, so that the clients
+     * still updating with it (the user's own, or whoever it was shared with) are logged as old_link.
+     */
+    public function rememberOldToken(string $token, User $user): void
+    {
+        if ($token === '') return;
+        try { Cache::put('risk:old-token:' . sha1($token), (int)$user->id, self::OLD_LINK_DAYS * 86400); } catch (\Throwable $e) { }
+    }
+
+    /**
+     * A subscription with a token no user has (answered 403 by the client middleware): if a reset replaced it, log it
+     * as old_link for the user it belonged to (answered 403 all the same, so 'unavailable').
+     */
+    public function recordOldLink(string $token, Request $request): void
+    {
+        try {
+            if ($token === '' || !$this->enabled()) return;
+            $userId = (int)Cache::get('risk:old-token:' . sha1($token), 0);
+            $user = $userId ? User::find($userId) : null;
+            if (!$user) return;
+            $key = 'risk:old-count:' . $userId . ':' . date('Ymd');
+            Cache::add($key, 0, 2 * 86400);
+            $this->record($user, 'old_link', $request, 'unavailable', (int)Cache::increment($key));
+        } catch (\Throwable $e) {
+            // Must never change the answer
+        }
+    }
+
+    /**
+     * Old links of the user in the last OLD_LINK_DAYS days: [requests, IPs (an IPv6 /64 as one), last time], or null.
+     */
+    public function oldLinks(User $user): ?array
+    {
+        $row = RiskAccess::where('user_id', $user->id)->where('event_type', self::TYPES['old_link'])
+            ->where('record_at', '>=', $this->day(time()) - (self::OLD_LINK_DAYS - 1) * 86400)
+            ->selectRaw('SUM(occurrences) AS total, COUNT(DISTINCT ip_net) AS ips, MAX(last_seen_at) AS last_seen_at')->first();
+        return $row && (int)$row->total ? [(int)$row->total, (int)$row->ips, (int)$row->last_seen_at] : null;
     }
 
     /**

@@ -47,8 +47,10 @@ through `RiskService`. Read the code before changing it:
   and the allowlist apart) and the audit log (`v2_risk_audit`; `changes.reason` explains changes made along the way).
 - `app/Services/RiskAccessService.php`: the access log `v2_risk_access` (every login, registration, subscription and
   order, one row per day, user, type, result, IP and user agent; an IPv6 address by its /64), the daily subscription
-  limit (`guardClient()` in `RiskService`, called from the client middleware) and the nodes' exit IPs (remembered by
-  the node APIs).
+  limit (`guardClient()` in `RiskService`, called from the client middleware), the nodes' exit IPs (remembered by the
+  node APIs), and old links: a token replaced by any reset is kept for 30 days (`rememberOldToken()`, from the User
+  model's `updated` event in `EventServiceProvider`), and the client middleware logs a subscription with it as
+  `old_link` before its 403.
 - `app/Services/RiskAlertService.php`: keeps alerts from flooding the alert chat. Alerts about one subject (a user, or
   an IP) go out once a day, later ones update that message (`EditRiskAlertJob`, every 5 minutes at most); each kind has
   a daily budget (`alert_daily_limit`); the jobs send at most 15 messages a minute and wait out Telegram's 429.
