@@ -73,6 +73,19 @@ through `RiskService`. Read the code before changing it:
 - `app/Http/Routes/V1/RiskAdminRoute.php` and `app/Http/Controllers/V1/Admin/RiskController.php`: the admin panel's
   `/{secure_path}/risk/*`, kept apart from `AdminRoute` so upstream changes apply cleanly.
 
+## Nodes
+
+Every node on the panel is a v2node one (`v2_server_v2node`, the protocol in `protocol`): the protocol tables
+(`v2_server_vless`…) are empty, and the admin panel adds v2node nodes only, one menu item per protocol. The v2node backend
+reads its config from `/api/v2/server/config` and calls UniProxy with `node_type=v2node` for users, traffic and online
+users. Older backends (V2bX, XrayR) call UniProxy by protocol (`node_type=vless`…): `UniProxyController` asks the
+protocol table first, then `V2nodeLegacyService::find()` (the v2node node with that id and protocol; `hysteria` is
+Hysteria 1 to V2bX and finds none). Such a node is kept as the v2node node itself (`$this->nodeType` becomes `v2node`: the
+cache keys, `v2_stat_server.server_type`, the devices), and `config` answers in the protocol table's format
+(`V2nodeLegacyService::config()`); an anytls node with Reality is refused there. Deepbwork and the Tidalab controllers
+still read the protocol tables only. Tests: `../demo/tests/nodes/` and `../demo/scripts/node-tests.sh`, which also runs
+the real V2bX, XrayR and v2node binaries against the demo.
+
 ## webman
 
 `webman.php` serves on `tcp://127.0.0.1:6600` with `WebmanHttp`, Adapterman's HTTP protocol wrapped so that a body it

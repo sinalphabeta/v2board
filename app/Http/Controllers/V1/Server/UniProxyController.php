@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Services\RiskAccessService;
 use App\Services\ServerService;
 use App\Services\UserService;
+use App\Services\V2nodeLegacyService;
 use App\Utils\CacheKey;
 use App\Utils\Helper;
 use Illuminate\Http\Request;
@@ -18,6 +19,8 @@ class UniProxyController extends Controller
     private $nodeInfo;
     private $nodeId;
     private $serverService;
+    // fork: a v2node node asked for by its protocol (V2nodeLegacyService)
+    private $legacy = false;
 
     public function __construct(Request $request)
     {
@@ -34,6 +37,14 @@ class UniProxyController extends Controller
         $this->nodeId = $request->input('node_id');
         $this->serverService = new ServerService();
         $this->nodeInfo = $this->serverService->getServer($this->nodeId, $this->nodeType);
+        if (!$this->nodeInfo && $this->nodeType !== 'v2node') {
+            // fork: V2bX, XrayR ask by protocol; the node is a v2node one and is kept (users, traffic, online) as such
+            $this->nodeInfo = (new V2nodeLegacyService())->find($request->input('node_type'), $this->nodeId);
+            if ($this->nodeInfo) {
+                $this->nodeType = 'v2node';
+                $this->legacy = true;
+            }
+        }
         if (!$this->nodeInfo) abort(500, 'server is not exist');
         (new RiskAccessService())->rememberNode($request);
     }
@@ -295,6 +306,10 @@ class UniProxyController extends Controller
                     'server_name' => $this->nodeInfo->server_name,
                     'padding_scheme' => $this->nodeInfo->padding_scheme
                 ];
+                break;
+            case 'v2node':
+                // fork: in the format of the protocol it was asked for (v2node itself reads /api/v2/server/config)
+                if ($this->legacy) $response = (new V2nodeLegacyService())->config($this->nodeInfo);
                 break;
         }
         $response['base_config'] = [
