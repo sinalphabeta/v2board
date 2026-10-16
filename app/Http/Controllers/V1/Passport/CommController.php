@@ -7,6 +7,7 @@ use App\Http\Requests\Passport\CommSendEmailVerify;
 use App\Jobs\SendEmailJob;
 use App\Models\InviteCode;
 use App\Models\User;
+use App\Services\RiskService;
 use App\Utils\CacheKey;
 use App\Utils\Dict;
 use App\Utils\Helper;
@@ -30,7 +31,7 @@ class CommController extends Controller
 
     public function sendEmailVerify(CommSendEmailVerify $request)
     {
-        $ip = $request->ip();
+        $ip = (new RiskService())->clientNet($request);
         if (RateLimiter::tooManyAttempts($ip, 3)) {
             abort(429, __('Too many requests, please try again later.'));
         }

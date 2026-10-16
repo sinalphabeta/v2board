@@ -24,8 +24,9 @@ class AuthController extends Controller
     public function register(AuthRegister $request)
     {
         $riskService = new RiskService();
+        $registerIp = $riskService->clientNet($request);
         if ((int)config('v2board.register_limit_by_ip_enable', 0)) {
-            $registerCountByIP = Cache::get(CacheKey::get('REGISTER_IP_RATE_LIMIT', $request->ip())) ?? 0;
+            $registerCountByIP = Cache::get(CacheKey::get('REGISTER_IP_RATE_LIMIT', $registerIp)) ?? 0;
             if ((int)$registerCountByIP >= (int)config('v2board.register_limit_count', 3)) {
                 abort(500, __('Register frequently, please try again after :minute minute', [
                     'minute' => config('v2board.register_limit_expire', 60)
@@ -126,7 +127,7 @@ class AuthController extends Controller
 
         if ((int)config('v2board.register_limit_by_ip_enable', 0)) {
             Cache::put(
-                CacheKey::get('REGISTER_IP_RATE_LIMIT', $request->ip()),
+                CacheKey::get('REGISTER_IP_RATE_LIMIT', $registerIp),
                 (int)$registerCountByIP + 1,
                 (int)config('v2board.register_limit_expire', 60) * 60
             );

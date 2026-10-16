@@ -268,6 +268,15 @@ class RiskService
         return filter_var($candidate, FILTER_VALIDATE_IP) ? $candidate : '0.0.0.0';
     }
 
+    /**
+     * Who a per-visitor limit counts: the real IP, an IPv6 address by its /64 (one address each would let anyone with
+     * a /64 change address to get round it). $request->ip() is nginx's 127.0.0.1 under webman, the same for everyone.
+     */
+    public function clientNet(Request $request): string
+    {
+        return $this->access()->ipNet($this->clientIp($request));
+    }
+
     public function indicatorsFor(string $type, $value = null)
     {
         $query = RiskIndicator::where('type', $type)->where('enabled', 1);
