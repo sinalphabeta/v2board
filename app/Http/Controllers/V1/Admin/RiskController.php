@@ -11,6 +11,7 @@ use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\ServerGroup;
 use App\Models\User;
+use App\Plugins\RiskTelegram\RiskOperator;
 use App\Services\IpInfoService;
 use App\Services\RiskAccessService;
 use App\Services\RiskService;
@@ -77,6 +78,19 @@ class RiskController extends Controller
             $chatId = trim((string)$request->input('alert_chat_id'));
             if ($chatId !== '' && !preg_match('/^-?\d+$/', $chatId)) abort(500, '告警群 Chat ID 应该是数字：在群里给风险 Bot 发 /id 可以查看');
             $values['alert_chat_id'] = $chatId;
+        }
+        if ($request->has('bot_operators')) {
+            $operators = [];
+            foreach (preg_split('/[\r\n,，]+/u', (string)$request->input('bot_operators')) as $entry) {
+                $entry = trim($entry);
+                if ($entry === '') continue;
+                if (!preg_match('/^([1-9]\d{3,15})(?:\s+(\S.{0,19}))?$/u', $entry, $match)) {
+                    abort(500, '可操作的 Telegram ID 每行一个：先写数字 ID（在风险 Bot 里发 /id 可以查看），后面可以空一格写备注，最多 20 个字');
+                }
+                $operators[$match[1]] = $match[1] . (isset($match[2]) ? ' ' . trim($match[2]) : '');
+            }
+            if (count($operators) > 20) abort(500, '可操作的 Telegram ID 最多 20 个');
+            $values['bot_operators'] = implode("\n", $operators);
         }
         if ($request->has('honeypot_group_id')) {
             $groupId = trim((string)$request->input('honeypot_group_id'));
@@ -414,8 +428,11 @@ class RiskController extends Controller
             $ids = $rows->pluck('actor_id')->merge($rows->pluck('user_id'))->filter()->unique()->values();
             $emails = User::whereIn('id', $ids)->pluck('email', 'id');
             return $rows->map(function (RiskAudit $row) use ($emails) {
+                // A 'tg' actor is a Telegram ID, not a user id
+                $tg = $row->actor_type === 'tg';
                 return $row->toArray() + [
-                    'actor_email' => $row->actor_id ? ($emails[$row->actor_id] ?? null) : null,
+                    'actor_email' => $row->actor_id && !$tg ? ($emails[$row->actor_id] ?? null) : null,
+                    'actor_name' => $tg && $row->actor_id ? RiskOperator::nameOf((int)$row->actor_id) : null,
                     'user_email' => $row->user_id ? ($emails[$row->user_id] ?? null) : null,
                 ];
             })->values();

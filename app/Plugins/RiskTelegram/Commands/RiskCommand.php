@@ -2,8 +2,8 @@
 
 namespace App\Plugins\RiskTelegram\Commands;
 
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 
 abstract class RiskCommand
 {
@@ -18,7 +18,7 @@ abstract class RiskCommand
 
     /**
      * $message: command, args, chat_id, message_id, is_private, sender_id and reply_text (the risk bot's message it
-     * replies to). $admin is null only for public commands.
+     * replies to). $operator is null only for public commands.
      */
-    abstract public function handle(RiskBot $bot, $message, ?User $admin): void;
+    abstract public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void;
 }

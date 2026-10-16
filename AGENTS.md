@@ -59,7 +59,9 @@ through `RiskService`. Read the code before changing it:
 - `app/Services/IpInfoService.php`: the qqwry and DB-IP city / ASN databases (`risk:geoip-update`); `lookup()` for
   alerts, `lookupMany()` for the admin lists.
 - `app/Plugins/RiskTelegram/`: the risk bot (`RiskBot`, `RiskView`, `Commands/*`). New commands show in Telegram's
-  command menu after 设置风险 Bot Webhook on the admin panel.
+  command menu after 设置风险 Bot Webhook on the admin panel. `RiskOperator`: who may use it (the Telegram IDs listed
+  in `bot_operators`, or while none are, admins with a bound Telegram account); the audit log records the Telegram ID
+  (actor type `tg`).
 - `app/Http/Routes/V1/RiskAdminRoute.php` and `app/Http/Controllers/V1/Admin/RiskController.php`: the admin panel's
   `/{secure_path}/risk/*`, kept apart from `AdminRoute` so upstream changes apply cleanly.
 

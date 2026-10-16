@@ -2,8 +2,8 @@
 
 namespace App\Plugins\RiskTelegram\Commands;
 
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 use App\Services\RiskService;
 
 /**
@@ -16,7 +16,7 @@ abstract class IndicatorCommand extends RiskCommand
     protected $action;
     protected $usage;
 
-    public function handle(RiskBot $bot, $message, ?User $admin): void
+    public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void
     {
         if ($this->action === 'list') {
             $bot->replyView($message, $bot->view()->indicators($this->type, (int)($message->args[0] ?? 1)));
@@ -34,7 +34,7 @@ abstract class IndicatorCommand extends RiskCommand
             $bot->reply($message, '用法: ' . $bot->view()->code($this->command . ' ' . $this->usage), true);
             return;
         }
-        if ($this->action === 'add') $bot->addIndicators($message, $admin, $this->type, $values);
-        else $bot->removeIndicators($message, $admin, $this->type, $values);
+        if ($this->action === 'add') $bot->addIndicators($message, $operator, $this->type, $values);
+        else $bot->removeIndicators($message, $operator, $this->type, $values);
     }
 }

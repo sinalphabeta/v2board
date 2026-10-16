@@ -2,8 +2,8 @@
 
 namespace App\Plugins\RiskTelegram\Commands;
 
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 
 class Menu extends RiskCommand
 {
@@ -12,7 +12,7 @@ class Menu extends RiskCommand
     public $sort = 10;
     public $aliases = ['/start'];
 
-    public function handle(RiskBot $bot, $message, ?User $admin): void
+    public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void
     {
         $bot->replyView($message, $bot->view()->menu());
     }

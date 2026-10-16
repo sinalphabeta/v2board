@@ -955,3 +955,6 @@ CREATE TABLE IF NOT EXISTS `v2_risk_access` (
 
 ALTER TABLE `v2_risk_event`
   ADD `detail` varchar(255) DEFAULT NULL AFTER `indicator_ids`;
+
+ALTER TABLE `v2_risk_audit`
+  MODIFY `actor_id` bigint(20) DEFAULT NULL;

@@ -2,8 +2,8 @@
 
 namespace App\Plugins\RiskTelegram\Commands;
 
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 
 class Help extends RiskCommand
 {
@@ -11,7 +11,7 @@ class Help extends RiskCommand
     public $description = '帮助';
     public $sort = 140;
 
-    public function handle(RiskBot $bot, $message, ?User $admin): void
+    public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void
     {
         $bot->replyView($message, $bot->view()->help());
     }

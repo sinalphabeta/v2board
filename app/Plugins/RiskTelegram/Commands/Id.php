@@ -2,8 +2,8 @@
 
 namespace App\Plugins\RiskTelegram\Commands;
 
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 
 class Id extends RiskCommand
 {
@@ -12,7 +12,7 @@ class Id extends RiskCommand
     public $sort = 150;
     public $public = true;
 
-    public function handle(RiskBot $bot, $message, ?User $admin): void
+    public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void
     {
         if ($message->is_private) {
             $bot->reply($message, (string)$message->sender_id);

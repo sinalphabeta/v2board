@@ -2,8 +2,8 @@
 
 namespace App\Plugins\RiskTelegram\Commands;
 
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 
 class Events extends RiskCommand
 {
@@ -11,7 +11,7 @@ class Events extends RiskCommand
     public $description = '最近的风险事件';
     public $sort = 60;
 
-    public function handle(RiskBot $bot, $message, ?User $admin): void
+    public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void
     {
         $bot->replyView($message, $bot->view()->events((int)($message->args[0] ?? 1)));
     }

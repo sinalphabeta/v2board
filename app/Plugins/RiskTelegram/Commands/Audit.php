@@ -2,8 +2,8 @@
 
 namespace App\Plugins\RiskTelegram\Commands;
 
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 
 class Audit extends RiskCommand
 {
@@ -11,7 +11,7 @@ class Audit extends RiskCommand
     public $description = '操作记录';
     public $sort = 120;
 
-    public function handle(RiskBot $bot, $message, ?User $admin): void
+    public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void
     {
         $bot->replyView($message, $bot->view()->audit((int)($message->args[0] ?? 1)));
     }

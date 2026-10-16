@@ -18,6 +18,8 @@ class RiskSettings
     public const DEFAULTS = [
         'bot_token' => '',
         'alert_chat_id' => '',
+        // Who may use the risk bot, one Telegram ID a line with an optional note (RiskOperator); empty: bound admins
+        'bot_operators' => '',
         'honeypot_group_id' => 0,
         'ip_info_enabled' => true,
         'asn_cache_ttl' => 3600,

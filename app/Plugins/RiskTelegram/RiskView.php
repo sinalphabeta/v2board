@@ -37,7 +37,7 @@ class RiskView
     ];
     // Settings edited on the admin panel (RiskSettings)
     public const SETTINGS = [
-        'bot_token' => 'Bot Token', 'alert_chat_id' => '告警群 Chat ID', 'honeypot_group_id' => '蜜罐权限组',
+        'bot_token' => 'Bot Token', 'alert_chat_id' => '告警群 Chat ID', 'bot_operators' => '可操作的 Telegram ID', 'honeypot_group_id' => '蜜罐权限组',
         'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
         'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
         'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
@@ -134,6 +134,9 @@ class RiskView
             '🩺 *风控状态*',
             '蜜罐权限组：' . ($honeypot > 0 ? $this->code($honeypot) . ($group ? ' ' . $this->escape($group->name) : ' ⚠️ 不存在') : '未配置'),
             '告警群：' . (RiskSettings::get('alert_chat_id') ? '已配置' : '未配置'),
+            '可操作的人：' . (count(RiskOperator::listed())
+                ? count(RiskOperator::listed()) . ' 个 Telegram ID'
+                : $this->escape('⚠️ 没设置（绑定了 Telegram 的管理员都能操作）：在风控概览里填「可操作的 Telegram ID」')),
             '启用的名单：' . collect(RiskService::RULE_TYPES)->map(function ($type) use ($counts) {
                 return self::TYPES[$type] . ' ' . $counts[$type];
             })->implode(' · '),
@@ -548,6 +551,7 @@ class RiskView
     {
         if ($row->actor_type === 'admin') return '管理端 uid ' . $this->code((int)$row->actor_id);
         if ($row->actor_type === 'bot') return 'Bot uid ' . $this->code((int)$row->actor_id);
+        if ($row->actor_type === 'tg') return 'Bot ' . $this->escape(RiskOperator::nameOf((int)$row->actor_id));
         if ($row->actor_type === 'api') return 'API' . ($row->actor_ip ? ' ' . $this->code($row->actor_ip) : '');
         if ($row->actor_type === 'system') return '系统';
         return '未知';

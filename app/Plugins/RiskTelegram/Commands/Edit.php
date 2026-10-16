@@ -3,8 +3,8 @@
 namespace App\Plugins\RiskTelegram\Commands;
 
 use App\Models\RiskIndicator;
-use App\Models\User;
 use App\Plugins\RiskTelegram\RiskBot;
+use App\Plugins\RiskTelegram\RiskOperator;
 use App\Plugins\RiskTelegram\RiskView;
 use App\Services\RiskService;
 
@@ -14,7 +14,7 @@ class Edit extends RiskCommand
     public $description = '修改名单备注：/edit 值或ID 备注';
     public $sort = 110;
 
-    public function handle(RiskBot $bot, $message, ?User $admin): void
+    public function handle(RiskBot $bot, $message, ?RiskOperator $operator): void
     {
         $view = $bot->view();
         $target = (string)($message->args[0] ?? '');
@@ -27,7 +27,7 @@ class Edit extends RiskCommand
             $bot->reply($message, '备注太长，最多 255 个字');
             return;
         }
-        $service = (new RiskService())->actingAs('bot', $admin->id);
+        $service = $operator->service();
         $indicators = ctype_digit($target) ? RiskIndicator::where('id', (int)$target)->get() : $this->findByValue($service, $target);
         if ($indicators->isEmpty()) {
             $bot->reply($message, '未找到：' . $view->code($target), true);

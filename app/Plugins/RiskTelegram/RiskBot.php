@@ -12,8 +12,9 @@ use App\Services\RiskSettings;
 use App\Services\TelegramService;
 
 /**
- * The risk bot: turns Telegram updates into commands and button actions, and checks who may use them.
- * Only admins whose Telegram account is bound (telegram_id) may act; commands work in private chats and the alert chat.
+ * The risk bot: turns Telegram updates into commands and button actions, and checks who may use them (RiskOperator:
+ * the listed Telegram IDs, or while none are listed, admins whose Telegram account is bound). Commands work in private
+ * chats and the alert chat.
  */
 class RiskBot
 {
@@ -55,13 +56,15 @@ class RiskBot
             'message_id' => (int)($data['message_id'] ?? 0),
             'is_private' => ($data['chat']['type'] ?? '') === 'private',
             'sender_id' => (int)($data['from']['id'] ?? $data['chat']['id']),
+            // A group's anonymous admin, or a message sent on behalf of a channel or group: who sent it is unknown
+            'anonymous' => (int)($data['from']['id'] ?? 0) === RiskOperator::ANONYMOUS_ADMIN || isset($data['sender_chat']),
             'reply_text' => $this->repliedText($data),
         ];
         foreach (self::commands() as $command) {
             if ($command->command !== $name && !in_array($name, $command->aliases, true)) continue;
             try {
-                $admin = $command->public ? null : $this->authorize($message);
-                if ($command->public || $admin) $command->handle($this, $message, $admin);
+                $operator = $command->public ? null : $this->authorize($message);
+                if ($command->public || $operator) $command->handle($this, $message, $operator);
             } catch (\Throwable $e) {
                 report($e);
                 $this->reply($message, '处理失败，请检查服务日志');
@@ -75,8 +78,8 @@ class RiskBot
         $id = (string)($callback['id'] ?? '');
         $message = $callback['message'] ?? null;
         if (!is_array($message) || !isset($message['chat']['id'], $message['message_id'])) return;
-        $admin = $this->adminFor((int)($callback['from']['id'] ?? 0));
-        if (!$admin) {
+        $operator = RiskOperator::find((int)($callback['from']['id'] ?? 0));
+        if (!$operator) {
             $this->telegram->answerCallbackQuery($id, '无权限');
             return;
         }
@@ -92,7 +95,7 @@ class RiskBot
             'alert' => false,
         ];
         try {
-            $notice = $this->runCallback((string)($callback['data'] ?? ''), $context, $admin);
+            $notice = $this->runCallback((string)($callback['data'] ?? ''), $context, $operator);
         } catch (\Throwable $e) {
             report($e);
             $notice = '处理失败，请检查服务日志';
@@ -128,9 +131,9 @@ class RiskBot
     /**
      * /add, /addip and the like: add the values as indicators of the type.
      */
-    public function addIndicators($message, User $admin, string $type, array $values): void
+    public function addIndicators($message, RiskOperator $operator, string $type, array $values): void
     {
-        $result = (new RiskService())->actingAs('bot', $admin->id)->addIndicators($type, $values);
+        $result = $operator->service()->addIndicators($type, $values);
         $notes = $type === 'email' && $result['added'] ? $this->usersLine('🔒 已隔离', $result['added'], true) : [];
         if ($type === 'allow_ip' && $result['invalid']) $notes[] = $this->view->escape(RiskService::ALLOW_IP_FORMAT);
         $this->reply($message, $this->view->result([
@@ -142,9 +145,9 @@ class RiskBot
     /**
      * /del, /delip and the like: disable the indicators with these values.
      */
-    public function removeIndicators($message, User $admin, string $type, array $values): void
+    public function removeIndicators($message, RiskOperator $operator, string $type, array $values): void
     {
-        $service = (new RiskService())->actingAs('bot', $admin->id);
+        $service = $operator->service();
         $deleted = $missing = [];
         foreach ($values as $rawValue) {
             $value = $service->normalizeIndicatorValue($type, $rawValue) ?? trim((string)$rawValue);
@@ -161,7 +164,7 @@ class RiskBot
         $this->reply($message, $this->view->result(['✅ 删除' => $deleted, '⚠️ 不存在' => $missing], $notes), true);
     }
 
-    private function runCallback(string $data, $context, User $admin): string
+    private function runCallback(string $data, $context, RiskOperator $operator): string
     {
         // Paging buttons on messages sent before the menu existed
         if (preg_match('/^risk_(list|users|ip|ua|asn):(\d+)$/', $data, $match)) {
@@ -181,7 +184,7 @@ class RiskBot
             case 'd': $this->edit($context, $this->view->report((new RiskService())->links()->reportToday(), true)); return '';
             case 'n': return $this->ipUsers(str_replace('-', ':', (string)($parts[2] ?? '')), $context);
         }
-        if (in_array($verb, ['p', 'P', 'k', 'w', 'W'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $admin);
+        if (in_array($verb, ['p', 'P', 'k', 'w', 'W'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $operator);
         if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x', 's', 'S', 't', 'T'], true)) return '';
 
         $card = in_array($verb, ['c', 'cr', 'ue'], true);
@@ -191,7 +194,7 @@ class RiskBot
         if ($verb === 'cr') $this->send($context->chat_id, $this->view->userCard($user), $context->message_id);
         if ($verb === 'ue') $this->edit($context, $this->view->userEvents($user, (string)($parts[3] ?? 's'), $int(4)));
         if ($card) return '';
-        return $this->userAction($verb, (string)($parts[2] ?? ''), $user, RiskEvent::find($int(4)), $context, $admin);
+        return $this->userAction($verb, (string)($parts[2] ?? ''), $user, RiskEvent::find($int(4)), $context, $operator);
     }
 
     /**
@@ -210,7 +213,7 @@ class RiskBot
      * From an alert ('a') or a user card ('c'): isolating or releasing a user, resetting their subscription, letting
      * their subscriptions through today. Ask first, then do it.
      */
-    private function userAction(string $verb, string $where, User $user, ?RiskEvent $event, $context, User $admin): string
+    private function userAction(string $verb, string $where, User $user, ?RiskEvent $event, $context, RiskOperator $operator): string
     {
         $suffix = "{$where}:{$user->id}:" . ($event ? $event->id : '');
         $email = $this->view->shorten($user->email, 32);
@@ -224,7 +227,7 @@ class RiskBot
         }
         if ($verb === 't') return $this->askToConfirm($context, "确认今天放行 {$email}", "r:T:{$suffix}", "r:x:{$suffix}");
 
-        $service = (new RiskService())->actingAs('bot', $admin->id);
+        $service = $operator->service();
         $notice = '';
         $line = '';
         if ($verb === 'I') {
@@ -269,7 +272,7 @@ class RiskBot
     /**
      * Buttons of an alert about one event: list its IP, allowlist it, or mark the alert handled.
      */
-    private function eventAction(string $verb, ?RiskEvent $event, $context, User $admin): string
+    private function eventAction(string $verb, ?RiskEvent $event, $context, RiskOperator $operator): string
     {
         if (!$event) return '找不到这条事件';
         $user = $event->user_id ? User::find($event->user_id) : null;
@@ -280,7 +283,7 @@ class RiskBot
         if ($verb === 'p') {
             return $this->askToConfirm($context, "确认把 {$event->ip} 加入 IP 名单", "r:P:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
         }
-        $service = (new RiskService())->actingAs('bot', $admin->id);
+        $service = $operator->service();
         if ($verb === 'w' || $verb === 'W') return $this->allowEventIp($verb === 'W', $event, $user, $context, $service);
         $ip = $service->normalizeIndicatorValue('ip', $event->ip);
         if ($ip === null) return 'IP 无效';
@@ -331,21 +334,20 @@ class RiskBot
         return '';
     }
 
-    private function authorize($message): ?User
+    private function authorize($message): ?RiskOperator
     {
         $alertChatId = (string)RiskSettings::get('alert_chat_id');
         if (!$message->is_private && (!$alertChatId || (string)$message->chat_id !== $alertChatId)) {
             $this->reply($message, '请私聊风险 Bot 执行此命令');
             return null;
         }
-        $admin = $this->adminFor($message->sender_id);
-        if (!$admin) $this->reply($message, '无权限');
-        return $admin;
-    }
-
-    private function adminFor(int $telegramId): ?User
-    {
-        return $telegramId ? User::where('telegram_id', $telegramId)->where('is_admin', 1)->first() : null;
+        if ($message->anonymous) {
+            $this->reply($message, '匿名管理员认不出是谁，请关掉匿名再操作');
+            return null;
+        }
+        $operator = RiskOperator::find($message->sender_id);
+        if (!$operator) $this->reply($message, '无权限');
+        return $operator;
     }
 
     /**

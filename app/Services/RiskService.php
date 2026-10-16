@@ -73,8 +73,9 @@ class RiskService
     }
 
     /**
-     * Who makes the following changes, for the audit log: 'admin' (the admin's user id and IP), 'bot' (the admin's
-     * user id), or 'system' (the default, e.g. marking a user at registration). Older rows may also say 'api'.
+     * Who makes the following changes, for the audit log: 'admin' (the admin's user id and IP), 'tg' (the Telegram ID
+     * of whoever used the risk bot), or 'system' (the default, e.g. marking a user at registration). Older rows may also
+     * say 'bot' (the bound admin's user id) or 'api'.
      */
     public function actingAs(string $type, ?int $id = null, ?string $ip = null): self
     {

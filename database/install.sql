@@ -602,7 +602,7 @@ CREATE TABLE `v2_risk_indicator` (
 CREATE TABLE `v2_risk_audit` (
   `id` bigint(20) NOT NULL AUTO_INCREMENT,
   `actor_type` varchar(16) NOT NULL DEFAULT '',
-  `actor_id` int(11) DEFAULT NULL,
+  `actor_id` bigint(20) DEFAULT NULL,
   `actor_ip` varchar(45) DEFAULT NULL,
   `action` varchar(16) NOT NULL,
   `indicator_id` int(11) DEFAULT NULL,
