@@ -15,6 +15,7 @@ use App\Services\RiskService;
 use App\Utils\CacheKey;
 use App\Utils\Dict;
 use App\Utils\Helper;
+use Illuminate\Cache\RedisStore;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use ReCaptcha\ReCaptcha;
@@ -146,18 +147,23 @@ class AuthController extends Controller
         $email = $request->input('email');
         $password = $request->input('password');
 
-        if ((int)config('v2board.password_limit_enable', 1)) {
-            $passwordErrorCount = (int)Cache::get(CacheKey::get('PASSWORD_ERROR_LIMIT', $email), 0);
-            if ($passwordErrorCount >= (int)config('v2board.password_limit_count', 5)) {
+        $user = User::where('email', $email)->first();
+        if (!$user) {
+            abort(500, __('Incorrect email or password'));
+        }
+        // Wrong passwords are counted per account: MySQL finds the user by the email in any case, so a count by the
+        // email as typed starts again for each way of writing it. Each try is counted before the password is checked,
+        // atomically, so that tries sent at once are all counted.
+        $passwordLimit = (int)config('v2board.password_limit_enable', 1);
+        $passwordErrorKey = CacheKey::get('PASSWORD_ERROR_LIMIT', $user->id);
+        $passwordErrorExpire = 60 * (int)config('v2board.password_limit_expire', 60);
+        if ($passwordLimit) {
+            Cache::add($passwordErrorKey, 0, $passwordErrorExpire);
+            if ((int)Cache::increment($passwordErrorKey) > (int)config('v2board.password_limit_count', 5)) {
                 abort(500, __('There are too many password errors, please try again after :minute minutes.', [
                     'minute' => config('v2board.password_limit_expire', 60)
                 ]));
             }
-        }
-
-        $user = User::where('email', $email)->first();
-        if (!$user) {
-            abort(500, __('Incorrect email or password'));
         }
         if (!Helper::multiPasswordVerify(
             $user->password_algo,
@@ -165,16 +171,12 @@ class AuthController extends Controller
             $password,
             $user->password)
         ) {
-            if ((int)config('v2board.password_limit_enable')) {
-                Cache::put(
-                    CacheKey::get('PASSWORD_ERROR_LIMIT', $email),
-                    (int)$passwordErrorCount + 1,
-                    60 * (int)config('v2board.password_limit_expire', 60)
-                );
-            }
+            // The lock lasts until password_limit_expire minutes after the last wrong password
+            if ($passwordLimit) $this->restartExpiry($passwordErrorKey, $passwordErrorExpire);
             $riskService->recordAccess($user, 'login', $request, 'failed');
             abort(500, __('Incorrect email or password'));
         }
+        if ($passwordLimit) Cache::forget($passwordErrorKey);
 
         if ($user->banned) {
             abort(500, __('Your account has been suspended'));
@@ -283,5 +285,15 @@ class AuthController extends Controller
         return response([
             'data' => true
         ]);
+    }
+
+    /**
+     * Make a cache key expire $seconds from now, keeping its value. Laravel 8's cache has no touch(): on Redis this is
+     * EXPIRE; with another cache store the key keeps its expiry.
+     */
+    private function restartExpiry(string $key, int $seconds): void
+    {
+        $store = Cache::getStore();
+        if ($store instanceof RedisStore) $store->connection()->expire($store->getPrefix() . $key, $seconds);
     }
 }
