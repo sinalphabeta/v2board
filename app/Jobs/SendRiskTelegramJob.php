@@ -7,6 +7,7 @@ use App\Models\User;
 use App\Plugins\RiskTelegram\RiskView;
 use App\Services\IpInfoService;
 use App\Services\RiskAlertService;
+use App\Services\RiskService;
 use App\Services\RiskSettings;
 use App\Services\TelegramService;
 use Illuminate\Bus\Queueable;
@@ -79,6 +80,10 @@ class SendRiskTelegramJob implements ShouldQueue
                 $text = substr_replace($text, $ipLine . $infoLines, $position, strlen($ipLine));
             }
         }
+        // A node's exit IP: the user came through a node, so the IP says nothing of where they are
+        $node = $this->nodeLabel();
+        $uaPosition = $node !== null ? strpos($text, "\nua: ") : false;
+        if ($uaPosition !== false) $text = substr_replace($text, "\nnode: " . $this->markdownCode($node), $uaPosition, 0);
         // Buttons follow the user's state when the alert is sent, e.g. 解除隔离 for an isolated user
         $user = $this->userId ? User::find($this->userId) : null;
         $event = $user && $this->eventId ? RiskEvent::find($this->eventId) : null;
@@ -98,6 +103,19 @@ class SendRiskTelegramJob implements ShouldQueue
         if ($this->subject && $messageId) {
             $alerts->sent($this->subject, (string)$this->day, $this->telegramId, $messageId, $text, !$this->remind);
         }
+    }
+
+    /**
+     * What the alert says of a node's exit IP: the node IP entry's note (or its value), 自动识别 for an IP the node APIs
+     * were called from lately; null for any other IP.
+     */
+    private function nodeLabel(): ?string
+    {
+        if (!filter_var($this->ip, FILTER_VALIDATE_IP)) return null;
+        $risk = new RiskService();
+        $entry = $risk->nodeEntryFor($this->ip);
+        if ($entry) return $entry->note ?: $entry->value;
+        return $risk->access()->seenAsNode($this->ip) ? '自动识别' : null;
     }
 
     private function markdownCode($value): string

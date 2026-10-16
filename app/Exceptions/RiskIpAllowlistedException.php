@@ -5,7 +5,7 @@ namespace App\Exceptions;
 use App\Models\RiskIndicator;
 
 /**
- * An IP indicator was not added, enabled or changed because an enabled IP allowlist entry covers it.
+ * An IP indicator was not added, enabled or changed because an enabled allowlist entry (IP 白名单 or 节点 IP) covers it.
  */
 class RiskIpAllowlistedException extends \RuntimeException
 {
@@ -14,7 +14,7 @@ class RiskIpAllowlistedException extends \RuntimeException
 
     public function __construct(string $value, RiskIndicator $entry)
     {
-        parent::__construct("{$value} is covered by the IP allowlist entry {$entry->value}");
+        parent::__construct("{$value} is covered by the {$entry->type} entry {$entry->value}");
         $this->value = $value;
         $this->entry = $entry;
     }

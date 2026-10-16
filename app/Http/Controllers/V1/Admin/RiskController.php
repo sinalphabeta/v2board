@@ -146,7 +146,7 @@ class RiskController extends Controller
     }
 
     /**
-     * IP indicators and the allowlist also say where their IPs are (a CIDR by its network address), see ipInfoFields().
+     * IP indicators and the allowlists also say where their IPs are (a CIDR by its network address), see ipInfoFields().
      */
     public function indicatorFetch(Request $request)
     {
@@ -166,7 +166,7 @@ class RiskController extends Controller
         }
         return $this->paged($request, $query->orderByDesc('id'), function ($indicators) {
             $ips = $indicators->filter(function (RiskIndicator $indicator) {
-                return in_array($indicator->type, ['ip', 'allow_ip'], true);
+                return $indicator->type === 'ip' || in_array($indicator->type, RiskService::ALLOW_TYPES, true);
             })->mapWithKeys(function (RiskIndicator $indicator) {
                 return [$indicator->id => explode('/', (string)$indicator->value)[0]];
             });
@@ -191,14 +191,14 @@ class RiskController extends Controller
             $indicator = RiskIndicator::find((int)$request->input('id'));
             if (!$indicator) abort(500, '名单不存在');
             $value = $service->normalizeIndicatorValue($indicator->type, $request->input('value', $indicator->value));
-            if ($value === null) abort(500, $indicator->type === 'allow_ip' ? RiskService::ALLOW_IP_FORMAT : '值的格式有误');
+            if ($value === null) abort(500, in_array($indicator->type, RiskService::ALLOW_TYPES, true) ? RiskService::ALLOW_IP_FORMAT : '值的格式有误');
             if (RiskIndicator::where('type', $indicator->type)->where('value', $value)->where('id', '!=', $indicator->id)->exists()) {
                 abort(500, '名单里已经有这个值');
             }
             try {
                 $service->updateIndicator($indicator, ['value' => $value, 'note' => $note], $disabled);
             } catch (RiskIpAllowlistedException $e) {
-                abort(500, "{$e->value} 在 IP 白名单 {$e->entry->value} 里，不能加入 IP 名单");
+                abort(500, "{$e->value} 在" . RiskService::entryPhrase($e->entry) . ' 里，不能加入 IP 名单');
             }
             return response(['data' => ['disabled' => $disabled]]);
         }
@@ -229,7 +229,7 @@ class RiskController extends Controller
             try {
                 $service->updateIndicator($indicator, ['enabled' => 1], $disabled);
             } catch (RiskIpAllowlistedException $e) {
-                abort(500, "{$e->value} 在 IP 白名单 {$e->entry->value} 里，不能启用");
+                abort(500, "{$e->value} 在" . RiskService::entryPhrase($e->entry) . ' 里，不能启用');
             }
         } else {
             $service->removeIndicator($indicator);
@@ -300,12 +300,13 @@ class RiskController extends Controller
             $ruleIds = $events->flatMap(function (RiskEvent $event) { return $this->ruleIds($event); })->unique()->values();
             $rules = RiskIndicator::whereIn('id', $ruleIds)->get(['id', 'type', 'value'])->keyBy('id');
             $service = new RiskService();
-            $allowlist = RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->pluck('value');
+            $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->pluck('value');
             $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
             $uaRules = RiskIndicator::where('type', 'ua')->where('enabled', 1)->pluck('value');
+            $isNode = $service->access()->nodeMatcher();
             $userCounts = $service->recentUserCounts($events->pluck('ip')->all());
             $info = (new IpInfoService())->lookupMany($events->pluck('ip')->all());
-            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $ipRules, $uaRules, $userCounts, $info) {
+            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $ipRules, $uaRules, $isNode, $userCounts, $info) {
                 $user = $users->get($event->user_id);
                 return [
                     'id' => $event->id,
@@ -314,10 +315,13 @@ class RiskController extends Controller
                     'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
                     'event_type' => $event->event_type,
                     'ip' => $event->ip,
-                    // Whether an enabled allowlist entry covers the IP now (the event may be from before)
+                    // Whether an enabled allowlist entry (IP 白名单 or 节点 IP) covers the IP now (the event may be from before)
                     'ip_allowed' => $allowlist->contains(function ($entry) use ($service, $event) {
                         return $service->ipMatches((string)$event->ip, $entry);
                     }),
+                    // A node's exit IP: in the node IP list, or one the node APIs were called from lately (not ip_allowed
+                    // then, until it is added to the list)
+                    'ip_node' => filter_var($event->ip, FILTER_VALIDATE_IP) ? $isNode((string)$event->ip) : false,
                     // The enabled IP indicator covering the IP now (the same IP or a range): it is listed already
                     'ip_listed' => $ipRules->first(function ($rule) use ($service, $event) {
                         return $service->ipMatches((string)$event->ip, trim((string)$rule));
@@ -389,10 +393,10 @@ class RiskController extends Controller
         return $this->paged($request, $query, function ($rows) use ($access) {
             $users = User::whereIn('id', $rows->pluck('user_id')->unique()->values())->get(['id', 'email', 'risk_status'])->keyBy('id');
             $info = (new IpInfoService())->lookupMany($rows->pluck('ip')->unique()->values()->all());
-            $nodes = $access->nodeNets();
+            $isNode = $access->nodeMatcher();
             $types = array_flip(RiskAccessService::TYPES);
             $results = array_flip(RiskAccessService::RESULTS);
-            return $rows->map(function (RiskAccess $row) use ($users, $info, $nodes, $types, $results) {
+            return $rows->map(function (RiskAccess $row) use ($users, $info, $isNode, $types, $results) {
                 $user = $users->get($row->user_id);
                 return [
                     // The primary key, for the table's row key
@@ -405,8 +409,8 @@ class RiskController extends Controller
                     'result' => $results[$row->result] ?? null,
                     'ip' => $row->ip,
                     'ip_net' => $row->ip_net,
-                    // A node's exit IP: the user updated their subscription through a node
-                    'ip_node' => $row->ip_net !== '' && isset($nodes[$row->ip_net]),
+                    // A node's exit IP (the node IP list, or seen calling the node APIs): the user came through a node
+                    'ip_node' => $row->ip_net !== '' && $isNode((string)$row->ip, (string)$row->ip_net),
                     // The row that takes a user's new IP and user agent combinations after many subscriptions in a day
                     'overflow' => $row->ip_net === '',
                     'user_agent' => $row->user_agent,
@@ -424,6 +428,22 @@ class RiskController extends Controller
     public function accessStats()
     {
         return response(['data' => (new RiskAccessService())->stats()]);
+    }
+
+    /**
+     * The IPs the node APIs were called from in the last 7 days that the node IP list does not cover yet (an IPv6
+     * address as its /64), the latest first, with where they are: offered on the node IP list to be added.
+     */
+    public function nodeAuto()
+    {
+        $nodes = (new RiskAccessService())->autoNodes();
+        $address = function (string $net) { return explode('/', $net)[0]; };
+        $info = $nodes ? (new IpInfoService())->lookupMany(array_map($address, array_keys($nodes))) : [];
+        $data = [];
+        foreach ($nodes as $net => $seen) {
+            $data[] = ['ip' => $net, 'last_seen_at' => $seen] + $this->ipInfoFields($info[$address($net)] ?? null);
+        }
+        return response(['data' => $data]);
     }
 
     public function auditFetch(Request $request)

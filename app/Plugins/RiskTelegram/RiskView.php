@@ -25,7 +25,8 @@ use App\Services\RiskSettings;
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
  *   r:s|t:<ctx>:<uid>:<eid> ask to reset the subscription / let it through today, r:S|T:… do it
  *   r:p:<eid> ask to list the event's IP, r:P:<eid> do it · r:k:<eid> mark the alert handled
- *   r:w:<eid> ask to allowlist the event's IP, r:W:<eid> do it
+ *   r:w:<eid> ask to allowlist the event's IP, r:W:<eid> do it · r:g:<eid> ask to add it to the node IPs, r:G:<eid> do it
+ *   r:na ask to add the node IPs found by the node APIs, r:NA do it
  */
 class RiskView
 {
@@ -49,21 +50,30 @@ class RiskView
     // Audit changes that the action itself already says
     private const IMPLIED = ['add' => ['value', 'enabled'], 'delete' => ['enabled']];
     private const PAGE_SIZE = 10;
-    // The nodes' exit IPs, read once per view
-    private $nodes;
+    // What a list says about itself, under its title
+    private const LIST_ABOUT = [
+        'allow_ip' => '这些 IP 命中 IP、ASN 名单不告警，UA、邮箱名单照常',
+        'node_ip' => '节点的出口 IP：和 IP 白名单一样，命中 IP、ASN 名单不告警，关联检测和日报的多地区也跳过；UA、邮箱名单照常',
+    ];
+    // How many of the node IPs found by the node APIs the node IP list shows
+    private const AUTO_NODES_SHOWN = 10;
+    // Tells a node's exit IP (RiskAccessService::nodeMatcher()), made once per view
+    private $isNode;
 
     public function menu(): array
     {
         $counts = $this->indicatorCounts();
         $rules = array_sum(array_intersect_key($counts, array_flip(RiskService::RULE_TYPES)));
         $text = "🛡 *风控菜单*\n已隔离 " . User::where('risk_status', RiskService::STATUS_RISK)->count() . ' 人 · 24 小时事件 ' .
-            RiskEvent::where('last_seen_at', '>=', time() - 86400)->count() . " 条 · 名单 {$rules} 条 · 白名单 {$counts['allow_ip']} 条";
+            RiskEvent::where('last_seen_at', '>=', time() - 86400)->count() . " 条 · 名单 {$rules} 条 · 白名单 {$counts['allow_ip']} 条 · " .
+            "节点 IP {$counts['node_ip']} 个";
         return $this->view($text, [
             [$this->button('👥 风险用户', 'r:u:1'), $this->button('⚡ 最近事件', 'r:e:1')],
             [$this->button('📧 邮箱名单', 'r:l:email:1'), $this->button('🌐 IP 名单', 'r:l:ip:1')],
             [$this->button('🧩 UA 名单', 'r:l:ua:1'), $this->button('🏢 ASN 名单', 'r:l:asn:1')],
-            [$this->button('🟢 IP 白名单', 'r:l:allow_ip:1'), $this->button('📊 今日概况', 'r:d')],
-            [$this->button('📝 操作记录', 'r:a:1'), $this->button('🩺 系统状态', 'r:h')],
+            [$this->button('🟢 IP 白名单', 'r:l:allow_ip:1'), $this->button('🛰 节点 IP', 'r:l:node_ip:1')],
+            [$this->button('📊 今日概况', 'r:d'), $this->button('📝 操作记录', 'r:a:1')],
+            [$this->button('🩺 系统状态', 'r:h')],
         ]);
     }
 
@@ -109,10 +119,24 @@ class RiskView
             return '• ' . $this->code($indicator->value) .
                 ($indicator->note ? ' — ' . $this->escape($this->shorten($indicator->note, 40)) : '');
         })->all();
-        $about = $type === 'allow_ip' ? "\n" . $this->escape('这些 IP 命中 IP、ASN 名单不告警，UA、邮箱名单照常') : '';
+        $about = isset(self::LIST_ABOUT[$type]) ? "\n" . $this->escape(self::LIST_ABOUT[$type]) : '';
         $text = '📋 *' . $this->escape(RiskService::LIST_NAMES[$type]) . "*{$about}\n共 {$total} 条 · 第 {$page}/{$pages} 页\n\n" .
             ($lines ? implode("\n", $lines) : '暂无');
-        return $this->view($text, [$this->pager("r:l:{$type}:", $page, $pages)]);
+        $keyboard = [$this->pager("r:l:{$type}:", $page, $pages)];
+        // The IPs the node APIs were called from that the list does not cover yet: they only skip the link checks, and
+        // only for NODE_DAYS days
+        $auto = $type === 'node_ip' ? (new RiskAccessService())->autoNodes() : [];
+        if ($auto) {
+            $shown = array_slice($auto, 0, self::AUTO_NODES_SHOWN, true);
+            $text .= "\n\n*" . $this->escape('自动识别到、还没加进来的 ' . count($auto) . ' 个') . "*\n" .
+                $this->escape(RiskAccessService::NODE_DAYS . ' 天内调过面板接口；没加进来时只跳过关联检测，' . RiskAccessService::NODE_DAYS . ' 天没再调就不算了') . "\n" .
+                implode("\n", array_map(function ($net) use ($shown) {
+                    return '• ' . $this->code($net) . ' · ' . $this->escape('最后 ' . $this->time($shown[$net]));
+                }, array_keys($shown))) .
+                (count($auto) > count($shown) ? "\n" . $this->escape('…') : '');
+            array_unshift($keyboard, [$this->button('➕ 全部加入节点 IP', 'r:na')]);
+        }
+        return $this->view($text, $keyboard);
     }
 
     public function audit(int $page): array
@@ -141,6 +165,8 @@ class RiskView
                 return self::TYPES[$type] . ' ' . $counts[$type];
             })->implode(' · '),
             'IP 白名单：' . $counts['allow_ip'],
+            '节点 IP：' . $this->escape('手动 ' . $counts['node_ip'] . ' 个 · 自动识别 ' . count($risk->access()->autoNodes()) .
+                ' 个还没加进来（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）'),
             '已隔离用户：' . User::where('risk_status', RiskService::STATUS_RISK)->count(),
             '24 小时事件：' . RiskEvent::where('last_seen_at', '>=', time() - 86400)->count(),
             'ASN 数据库：' . ($asnAvailable ? '可用' : '不可用'),
@@ -157,7 +183,6 @@ class RiskView
         $lines[] = '订阅上限：' . $this->escape($stats['daily_limit'] ? $stats['daily_limit'] . ' 次/天，超过返回 429' : '不限');
         $burst = (int)RiskSettings::get('sub_burst_limit');
         $lines[] = '订阅过频：' . $this->escape($burst > 0 ? "10 分钟 {$burst} 次起报（只告警）" : '不检测');
-        $lines[] = '节点出口 IP：' . $stats['nodes'] . $this->escape(' 个（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）');
         $lines[] = '关联检测：' . (RiskSettings::get('link_detection') ? '开 · 同 IP ' . (int)RiskSettings::get('link_ip_users') . ' 人起报' : '关') .
             ' · 每晚日报：' . (RiskSettings::get('daily_report') ? '开' : '关');
         $alerts = $risk->alerts()->dayCounts();
@@ -186,6 +211,7 @@ class RiskView
                 '/addua、/delua、/listua  UA 关键字',
                 '/addasn、/delasn、/listasn  AS 号',
                 '/addallow、/delallow、/listallow  IP 白名单：命中 IP、ASN 名单不告警',
+                '/addnode、/delnode、/listnode  节点 IP：节点的出口，和白名单一样',
                 '/list  邮箱名单',
                 '/edit 值或ID 备注  修改备注',
             ],
@@ -204,7 +230,7 @@ class RiskView
                 return $this->escape($line);
             }, $lines));
         }
-        $text .= "\n\n" . $this->escape('回复一条告警或用户卡片发 /add、/del、/search，回复一条告警发 /addip、/delip、/addallow，可以不写参数。') .
+        $text .= "\n\n" . $this->escape('回复一条告警或用户卡片发 /add、/del、/search，回复一条告警发 /addip、/delip、/addallow、/addnode，可以不写参数。') .
             "\n" . $this->escape('用户卡片和告警上的「重置订阅」会换掉订阅链接和 UUID，分享出去的立刻失效；用户本人要重新导入订阅。');
         return $this->view($text, [[$this->button('🏠 菜单', 'r:m')]]);
     }
@@ -303,9 +329,10 @@ class RiskView
 
     /**
      * Buttons under an alert about a user. A public IP in neither the IP list (as itself or in a range) nor the
-     * allowlist can be added to the IP list or allowlisted, on its own row so as not to be taken for the other; one in
-     * a listed range can still be let through by replying /addallow. Alerts of what a check found
-     * (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行, 重置订阅.
+     * allowlists can be added to the IP list or allowlisted, on its own row so as not to be taken for the other; one in
+     * a listed range can still be let through by replying /addallow. An IP the node APIs were called from is a node's
+     * exit, shared by everyone coming through the node: it is offered for the node IPs instead. Alerts of what a check
+     * found (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行, 重置订阅.
      */
     public function alertKeyboard(User $user, ?RiskEvent $event): array
     {
@@ -331,11 +358,13 @@ class RiskView
             $risk = new RiskService();
             $ip = (string)$event->ip;
             $open = $risk->allowRangeFor($ip) !== null && !$risk->allowEntryFor($ip) && !$risk->ipEntryFor($ip);
+            $node = $open && $risk->access()->seenAsNode($ip);
             $second = [];
-            if ($open) $second[] = $this->button('➕ IP 加入名单', "r:p:{$event->id}");
+            if ($open && !$node) $second[] = $this->button('➕ IP 加入名单', "r:p:{$event->id}");
             $second[] = $this->button('✅ 已处理', "r:k:{$event->id}");
             $rows[] = $second;
-            if ($open) $rows[] = [$this->button('🟢 放行此 IP（白名单）', "r:w:{$event->id}")];
+            if ($node) $rows[] = [$this->button('🛰 加入节点 IP', "r:g:{$event->id}")];
+            elseif ($open) $rows[] = [$this->button('🟢 放行此 IP（白名单）', "r:w:{$event->id}")];
         }
         return $rows;
     }
@@ -487,14 +516,13 @@ class RiskView
      */
     private function accessLine(RiskAccess $row): string
     {
-        if ($this->nodes === null) $this->nodes = (new RiskAccessService())->nodeNets();
-        $nodes = $this->nodes;
+        if ($this->isNode === null) $this->isNode = (new RiskAccessService())->nodeMatcher();
         $ua = trim(preg_replace('/\s+/', ' ', (string)$row->user_agent));
         $results = array_flip(RiskAccessService::RESULTS);
         // An old link is always refused: its result says nothing more
         $result = (int)$row->event_type === RiskAccessService::TYPES['old_link'] ? null : (self::ACCESS_RESULTS[$results[$row->result] ?? 'ok'] ?? null);
         $ip = $this->code($row->ip) . ($row->ip_net === '' ? ' ' . $this->escape('（当天请求太多，之后的都合在这一行）') : '') .
-            ($row->ip_net !== '' && isset($nodes[$row->ip_net]) ? ' 节点' : '');
+            ($row->ip_net !== '' && ($this->isNode)((string)$row->ip, (string)$row->ip_net) ? ' 节点' : '');
         return $this->code($this->time($row->last_seen_at, 'm-d H:i')) . ' \\| ' . $ip . ' \\| ' .
             $this->code($ua === '' ? '空 UA' : $this->shorten($ua, 40)) . ' \\| x' . (int)$row->occurrences .
             ($result ? ' · ' . $this->escape($result) : '');

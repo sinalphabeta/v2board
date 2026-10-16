@@ -24,10 +24,10 @@ abstract class IndicatorCommand extends RiskCommand
         }
         $values = $this->type === 'ua' ? array_filter([implode(' ', $message->args)]) : $message->args;
         // Without arguments, a reply to an alert or a user card takes the email or IP from it
-        if (!$values && in_array($this->type, ['email', 'ip', 'allow_ip'], true)) {
+        if (!$values && in_array($this->type, ['email', 'ip', 'allow_ip', 'node_ip'], true)) {
             $value = $bot->replyField($message, $this->type === 'email' ? 'email' : 'ip');
             // An alert's IPv6 address is allowlisted as its /64, as by the alert's button
-            if ($value !== null && $this->type === 'allow_ip') $value = (new RiskService())->allowRangeFor($value) ?? $value;
+            if ($value !== null && in_array($this->type, RiskService::ALLOW_TYPES, true)) $value = (new RiskService())->allowRangeFor($value) ?? $value;
             $values = array_filter([$value]);
         }
         if (!$values) {

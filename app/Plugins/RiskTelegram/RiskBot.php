@@ -7,6 +7,7 @@ use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\User;
 use App\Plugins\RiskTelegram\Commands\RiskCommand;
+use App\Services\RiskAccessService;
 use App\Services\RiskService;
 use App\Services\RiskSettings;
 use App\Services\TelegramService;
@@ -135,10 +136,10 @@ class RiskBot
     {
         $result = $operator->service()->addIndicators($type, $values);
         $notes = $type === 'email' && $result['added'] ? $this->usersLine('🔒 已隔离', $result['added'], true) : [];
-        if ($type === 'allow_ip' && $result['invalid']) $notes[] = $this->view->escape(RiskService::ALLOW_IP_FORMAT);
+        if (in_array($type, RiskService::ALLOW_TYPES, true) && $result['invalid']) $notes[] = $this->view->escape(RiskService::ALLOW_IP_FORMAT);
         $this->reply($message, $this->view->result([
             '✅ 新增' => $result['added'], '⚠️ 已存在' => $result['existing'], '❌ 格式无效' => $result['invalid'],
-            '🟢 在 IP 白名单里，没有加入' => $result['allowlisted'], '🌐 已从 IP 名单移除' => $result['disabled'],
+            '🟢 在 IP 白名单或节点 IP 里，没有加入' => $result['allowlisted'], '🌐 已从 IP 名单移除' => $result['disabled'],
         ], $notes), true);
     }
 
@@ -183,8 +184,10 @@ class RiskBot
             case 'h': $this->edit($context, $this->view->health()); return '';
             case 'd': $this->edit($context, $this->view->report((new RiskService())->links()->reportToday(), true)); return '';
             case 'n': return $this->ipUsers(str_replace('-', ':', (string)($parts[2] ?? '')), $context);
+            case 'na': return $this->askToConfirm($context, '确认全部加入节点 IP', 'r:NA', 'r:l:node_ip:1');
+            case 'NA': return $this->addAutoNodes($context, $operator);
         }
-        if (in_array($verb, ['p', 'P', 'k', 'w', 'W'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $operator);
+        if (in_array($verb, ['p', 'P', 'k', 'w', 'W', 'g', 'G'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $operator);
         if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x', 's', 'S', 't', 'T'], true)) return '';
 
         $card = in_array($verb, ['c', 'cr', 'ue'], true);
@@ -270,7 +273,19 @@ class RiskBot
     }
 
     /**
-     * Buttons of an alert about one event: list its IP, allowlist it, or mark the alert handled.
+     * 全部加入 under the node IP list: add the IPs the node APIs were called from that it does not cover yet.
+     */
+    private function addAutoNodes($context, RiskOperator $operator): string
+    {
+        $nets = array_keys((new RiskAccessService())->autoNodes());
+        $result = $nets ? $operator->service()->addIndicators('node_ip', $nets, '自动识别') : ['added' => [], 'disabled' => []];
+        $this->edit($context, $this->view->indicators('node_ip', 1));
+        if (!$result['added']) return '没有要加入的';
+        return '已加入节点 IP ' . count($result['added']) . ' 个' . ($result['disabled'] ? '，停用了被覆盖的 IP 名单 ' . count($result['disabled']) . ' 条' : '');
+    }
+
+    /**
+     * Buttons of an alert about one event: list its IP, allowlist it, add it to the node IPs, or mark the alert handled.
      */
     private function eventAction(string $verb, ?RiskEvent $event, $context, RiskOperator $operator): string
     {
@@ -281,7 +296,8 @@ class RiskBot
             return '已标记为已处理';
         }
         $service = $operator->service();
-        if ($verb === 'w' || $verb === 'W') return $this->allowEventIp($verb === 'W', $event, $user, $context, $service);
+        if ($verb === 'w' || $verb === 'W') return $this->allowEventIp($verb === 'W', $event, $user, $context, $service, 'allow_ip');
+        if ($verb === 'g' || $verb === 'G') return $this->allowEventIp($verb === 'G', $event, $user, $context, $service, 'node_ip');
         // The button of an alert sent before the IP was listed, as itself or in a range
         $listed = $service->ipEntryFor((string)$event->ip);
         if ($listed) {
@@ -297,7 +313,7 @@ class RiskBot
             $service->addIndicator('ip', $ip, $user ? "来自告警（uid {$user->id}）" : '来自告警');
         } catch (RiskIpAllowlistedException $e) {
             if ($user) $this->editKeyboard($context, $this->view->alertKeyboard($user, $event));
-            return "这个 IP 在 IP 白名单 {$e->entry->value} 里，不能加入 IP 名单";
+            return '这个 IP 在' . RiskService::entryPhrase($e->entry) . ' 里，不能加入 IP 名单';
         }
         $this->appendLine($context, "🌐 {$ip} 已加入 IP 名单 · {$context->by} · " . date('m-d H:i'),
             $user ? $this->view->alertKeyboard($user, $event) : []);
@@ -305,36 +321,43 @@ class RiskBot
     }
 
     /**
-     * 放行此 IP on an alert: first ask, saying what it does and how many users the IP had (many suggest a CDN or proxy
-     * address), then add it to the allowlist, an IPv6 address as its /64.
+     * 放行此 IP (allow_ip) or 加入节点 IP (node_ip) on an alert: first ask, saying what it does and how many users the
+     * IP had (many suggest a CDN or proxy address), then add it, an IPv6 address as its /64.
      */
-    private function allowEventIp(bool $confirmed, RiskEvent $event, ?User $user, $context, RiskService $service): string
+    private function allowEventIp(bool $confirmed, RiskEvent $event, ?User $user, $context, RiskService $service, string $type): string
     {
         $ip = (string)$event->ip;
         $range = $service->allowRangeFor($ip);
-        if ($range === null) return '内网、保留地址不能加入 IP 白名单';
+        $list = RiskService::listPhrase($type);
+        if ($range === null) return "内网、保留地址不能加入{$list}";
         $entry = $service->allowEntryFor($ip);
         if ($entry) {
             if ($user) $this->editKeyboard($context, $this->view->alertKeyboard($user, $event));
-            return "这个 IP 已在 IP 白名单 {$entry->value} 里";
+            return '这个 IP 已在' . RiskService::entryPhrase($entry) . ' 里';
         }
+        $node = $type === 'node_ip';
         if (!$confirmed) {
             $users = $service->recentUserCounts([$ip])[$ip] ?? 0;
             // The button of an alert sent before the IP was listed: the entry goes if the range covers it, otherwise
             // the range lets this IP through
             $listed = $service->ipEntryFor($ip);
-            $note = !$listed ? '' : ($service->ipRangeWithin($listed->value, $range)
-                ? "IP 名单 {$listed->value} 会停用。\n" : "它在 IP 名单 {$listed->value} 里，放行后只有它不再命中。\n");
-            $this->askToConfirm($context, "确认放行 {$range}", "r:W:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
+            $note = !$listed ? '' : ($service->ipRangeWithin($listed->value, $range) ? "IP 名单 {$listed->value} 会停用。\n"
+                : "它在 IP 名单 {$listed->value} 里，" . ($node ? '加入' : '放行') . "后只有它不再命中。\n");
+            $this->askToConfirm($context, ($node ? '确认加入节点 IP ' : '确认放行 ') . $range, ($node ? 'r:G:' : 'r:W:') . $event->id,
+                "r:x:a:{$event->user_id}:{$event->id}");
             $context->alert = true;
-            return '放行 ' . $range . ($range !== $ip ? '（这个 IPv6 地址所在的 /64）' : '') .
-                "：之后它命中 IP、ASN 名单不再告警，关联检测也跳过它；UA、邮箱名单照常。\n{$note}最近 30 天有 {$users} 个用户用过这个 IP，" .
+            $what = $range . ($range !== $ip ? '（这个 IPv6 地址所在的 /64）' : '');
+            if ($node) {
+                return "把 {$what} 加入节点 IP：节点调面板接口时用过它，经节点访问的用户也来自它。之后它命中 IP、ASN 名单不再告警，" .
+                    "关联检测也跳过它；UA、邮箱名单照常。\n{$note}最近 30 天有 {$users} 个用户用过这个 IP。";
+            }
+            return "放行 {$what}：之后它命中 IP、ASN 名单不再告警，关联检测也跳过它；UA、邮箱名单照常。\n{$note}最近 30 天有 {$users} 个用户用过这个 IP，" .
                 '人数多时可能是 CDN、代理或公司、学校的出口。';
         }
-        $service->addIndicator('allow_ip', $range, $user ? "来自告警（uid {$user->id}）" : '来自告警', $disabled);
-        $line = "🟢 {$range} 已加入 IP 白名单" . ($disabled ? '，停用了 IP 名单 ' . implode('、', $disabled) : '');
+        $service->addIndicator($type, $range, $user ? "来自告警（uid {$user->id}）" : '来自告警', $disabled);
+        $line = ($node ? '🛰 ' : '🟢 ') . "{$range} 已加入{$list}" . ($disabled ? '，停用了 IP 名单 ' . implode('、', $disabled) : '');
         $this->appendLine($context, "{$line} · {$context->by} · " . date('m-d H:i'), $user ? $this->view->alertKeyboard($user, $event) : []);
-        return '已加入 IP 白名单';
+        return "已加入{$list}";
     }
 
     private function askToConfirm($context, string $label, string $confirm, string $cancel): string

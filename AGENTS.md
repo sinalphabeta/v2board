@@ -41,16 +41,18 @@ and `risk:geoip-update`; the panel's supervisor starts webman and Horizon again.
 The admin mostly runs it from the Telegram risk bot on a phone; the admin panel's 风控 pages are secondary. Both go
 through `RiskService`. Read the code before changing it:
 
-- `app/Services/RiskService.php`: indicator types (`TYPES`; `allow_ip` is the IP allowlist, the others are rules),
-  matching and events (`observe()` from login, register and subscription), alerts (`SendRiskTelegramJob`), isolation
-  (an email indicator), adding and changing indicators (`addIndicators()`; `saveIndicatorChecked()` keeps the IP list
-  and the allowlist apart) and the audit log (`v2_risk_audit`; `changes.reason` explains changes made along the way).
-  An alert or event whose IP an IP indicator covers (`ipEntryFor()`, the same IP or a range) offers neither adding it
-  to the IP list nor allowlisting it.
+- `app/Services/RiskService.php`: indicator types (`TYPES`; `allow_ip`, the IP allowlist, and `node_ip`, the nodes'
+  exit IPs, are the allowlists in `ALLOW_TYPES`, the others are rules), matching and events (`observe()` from login,
+  register and subscription), alerts (`SendRiskTelegramJob`), isolation (an email indicator), adding and changing
+  indicators (`addIndicators()`; `saveIndicatorChecked()` keeps the IP list and the allowlists apart) and the audit log
+  (`v2_risk_audit`; `changes.reason` explains changes made along the way). An alert or event whose IP an IP indicator
+  covers (`ipEntryFor()`, the same IP or a range) offers neither adding it to the IP list nor allowlisting it.
 - `app/Services/RiskAccessService.php`: the access log `v2_risk_access` (every login, registration, subscription and
   order, one row per day, user, type, result, IP and user agent; an IPv6 address by its /64), the daily subscription
   limit (`guardClient()` in `RiskService`, called from the client middleware), the 10-minute count that alerts 订阅过频
-  (`countBurst()`), the nodes' exit IPs (remembered by the node APIs), and old links: a token replaced by any reset is
+  (`countBurst()`), the nodes' exit IPs (the node IP list kept by hand, and the IPs the node APIs were called from in
+  the last 7 days: `nodeMatcher()` marks both 节点, `autoNodes()` lists the ones the list does not cover yet; a node
+  whose traffic goes out through another server is only known by hand), and old links: a token replaced by any reset is
   kept for 30 days (`rememberOldToken()`, from the User model's `updated` event in `EventServiceProvider`), and the
   client middleware logs a subscription with it as `old_link` before its 403.
 - `app/Services/RiskAlertService.php`: keeps alerts from flooding the alert chat. Alerts about one subject (a user, or

@@ -27,6 +27,7 @@ class RiskAdminRoute
             $router->get('/event/fetch', 'V1\\Admin\\RiskController@eventFetch');
             $router->get('/access/fetch', 'V1\\Admin\\RiskController@accessFetch');
             $router->get('/access/stats', 'V1\\Admin\\RiskController@accessStats');
+            $router->get('/node/auto', 'V1\\Admin\\RiskController@nodeAuto');
             $router->get('/audit/fetch', 'V1\\Admin\\RiskController@auditFetch');
         });
     }

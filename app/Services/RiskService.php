@@ -35,15 +35,23 @@ class RiskService
         'sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联', 'sub_burst' => '订阅过频',
     ];
     /**
-     * Indicator types. allow_ip is an allowlist: requests from its IPs skip the IP and ASN rules. The others are
-     * risk rules (RULE_TYPES): a match is recorded and alerted, and an email match also isolates the user.
+     * Indicator types. allow_ip and node_ip are allowlists (ALLOW_TYPES). The others are risk rules (RULE_TYPES): a
+     * match is recorded and alerted, and an email match also isolates the user.
      */
-    public const TYPES = ['email' => '邮箱', 'ip' => 'IP', 'ua' => 'UA', 'asn' => 'ASN', 'allow_ip' => 'IP 白名单'];
-    public const LIST_NAMES = ['email' => '邮箱名单', 'ip' => 'IP 名单', 'ua' => 'UA 名单', 'asn' => 'ASN 名单', 'allow_ip' => 'IP 白名单'];
+    public const TYPES = ['email' => '邮箱', 'ip' => 'IP', 'ua' => 'UA', 'asn' => 'ASN', 'allow_ip' => 'IP 白名单', 'node_ip' => '节点 IP'];
+    public const LIST_NAMES = [
+        'email' => '邮箱名单', 'ip' => 'IP 名单', 'ua' => 'UA 名单', 'asn' => 'ASN 名单', 'allow_ip' => 'IP 白名单', 'node_ip' => '节点 IP',
+    ];
     public const RULE_TYPES = ['email', 'ip', 'ua', 'asn'];
+    /**
+     * The allowlists: requests from their IPs skip the IP and ASN rules, and the link checks leave the IPs out. node_ip
+     * holds the nodes' exit IPs (users who update their subscriptions through a node come from them), allow_ip any
+     * other IPs shared by design. An IP may be in both.
+     */
+    public const ALLOW_TYPES = ['allow_ip', 'node_ip'];
     // The shortest allowlist prefix by address length: at most a /16 (IPv4) or /48 (IPv6) is let through at once
     private const ALLOW_MIN_PREFIX = [32 => 16, 128 => 48];
-    public const ALLOW_IP_FORMAT = 'IP 白名单只接受 IP，或不大于 /16（IPv6 /48）的网段，也不能是 0.0.0.0 或 ::';
+    public const ALLOW_IP_FORMAT = 'IP 白名单和节点 IP 只接受 IP，或不大于 /16（IPv6 /48）的网段，也不能是 0.0.0.0 或 ::';
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
     private $ipInfoService;
     private $access;
@@ -111,7 +119,7 @@ class RiskService
         if ($type === 'asn') $value = (string)$this->normalizeAsn($value);
         if ($value === '' || mb_strlen($value, 'UTF-8') > 255) return null;
         if ($type === 'email') return filter_var($value, FILTER_VALIDATE_EMAIL) ? $value : null;
-        if ($type === 'ip' || $type === 'allow_ip') return $this->normalizeIpRange($value, $type === 'allow_ip');
+        if ($type === 'ip' || in_array($type, self::ALLOW_TYPES, true)) return $this->normalizeIpRange($value, $type !== 'ip');
         return in_array($type, ['ua', 'asn'], true) ? $value : null;
     }
 
@@ -162,11 +170,20 @@ class RiskService
     }
 
     /**
-     * The enabled IP allowlist entry that covers this IP or CIDR, read from the database (not the indicator cache).
+     * The enabled allowlist entry (IP 白名单 or 节点 IP) that covers this IP or CIDR, read from the database (not the
+     * indicator cache).
      */
     public function allowEntryFor(string $ipOrCidr): ?RiskIndicator
     {
-        return $this->entryCovering('allow_ip', $ipOrCidr);
+        return $this->entryCovering(self::ALLOW_TYPES, $ipOrCidr);
+    }
+
+    /**
+     * The enabled node IP entry that covers this IP or CIDR.
+     */
+    public function nodeEntryFor(string $ipOrCidr): ?RiskIndicator
+    {
+        return $this->entryCovering(['node_ip'], $ipOrCidr);
     }
 
     /**
@@ -175,12 +192,30 @@ class RiskService
      */
     public function ipEntryFor(string $ipOrCidr): ?RiskIndicator
     {
-        return $this->entryCovering('ip', $ipOrCidr);
+        return $this->entryCovering(['ip'], $ipOrCidr);
     }
 
-    private function entryCovering(string $type, string $ipOrCidr): ?RiskIndicator
+    /**
+     * A list's name to follow Chinese text like 在, 被 or 加入: ' IP 白名单', '节点 IP' (Latin letters keep a space from
+     * the Chinese before them).
+     */
+    public static function listPhrase(string $type): string
     {
-        return RiskIndicator::where('type', $type)->where('enabled', 1)->orderBy('id')->get()
+        $name = self::LIST_NAMES[$type] ?? $type;
+        return (preg_match('/^[A-Za-z]/', $name) ? ' ' : '') . $name;
+    }
+
+    /**
+     * An indicator by its list and value, the same way: ' IP 白名单 1.2.3.0/24', '节点 IP 1.2.3.0/24'.
+     */
+    public static function entryPhrase(RiskIndicator $entry): string
+    {
+        return self::listPhrase($entry->type) . ' ' . $entry->value;
+    }
+
+    private function entryCovering(array $types, string $ipOrCidr): ?RiskIndicator
+    {
+        return RiskIndicator::whereIn('type', $types)->where('enabled', 1)->orderBy('id')->get()
             ->first(function (RiskIndicator $entry) use ($ipOrCidr) {
                 return $this->ipRangeWithin($ipOrCidr, $entry->value);
             });
@@ -320,7 +355,7 @@ class RiskService
         // An allowlisted IP skips the IP and ASN rules, so its ASN is not looked up either
         $allowed = false;
         foreach ($indicators as $indicator) {
-            if ($indicator->type === 'allow_ip' && $this->ipMatches($ip, trim((string)$indicator->value))) {
+            if (in_array($indicator->type, self::ALLOW_TYPES, true) && $this->ipMatches($ip, trim((string)$indicator->value))) {
                 $allowed = true;
                 break;
             }
@@ -774,7 +809,7 @@ class RiskService
             if ($entry) throw new RiskIpAllowlistedException($indicator->value, $entry);
         }
         if (!$this->saveIndicator($indicator, $action)) return false;
-        if ($takesEffect && $indicator->type === 'allow_ip') $disabled = $this->disableIpsCoveredBy($indicator);
+        if ($takesEffect && in_array($indicator->type, self::ALLOW_TYPES, true)) $disabled = $this->disableIpsCoveredBy($indicator);
         return true;
     }
 
@@ -787,7 +822,7 @@ class RiskService
         foreach (RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->get() as $indicator) {
             if (!$this->ipRangeWithin($indicator->value, $entry->value)) continue;
             $indicator->enabled = 0;
-            if ($this->saveIndicator($indicator, 'delete', "被 IP 白名单 {$entry->value} 覆盖")) $disabled[] = $indicator->value;
+            if ($this->saveIndicator($indicator, 'delete', '被' . self::entryPhrase($entry) . ' 覆盖')) $disabled[] = $indicator->value;
         }
         return $disabled;
     }

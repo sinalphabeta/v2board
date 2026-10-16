@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\RiskAccess;
+use App\Models\RiskIndicator;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -12,7 +13,8 @@ use Illuminate\Support\Facades\DB;
  * The access log (v2_risk_access): every login, registration, subscription and order, one row per day (record_at, the
  * day's 0:00), user, type, result, IP and user agent, kept for access_log_days days; also subscriptions with a link that
  * a reset replaced (old_link, logged for the user it belonged to). Also the daily subscription limit, and the exit IPs
- * of the nodes, which the link checks leave out.
+ * of the nodes, which the link checks leave out: the node IP list (node_ip, kept by hand) and the IPs the node APIs
+ * were called from lately (remembered here, never complete: a node may go out through another server).
  *
  * An IPv6 address is merged by its /64 (ip_net), since clients rotate their addresses; ip keeps the last one seen.
  * Rows are written one statement each, outside any transaction; a write never fails the request: errors are reported at
@@ -238,6 +240,49 @@ class RiskAccessService
         if (!is_array($nodes)) return [];
         $since = time() - self::NODE_DAYS * 86400;
         return array_filter($nodes, function ($seen) use ($since) { return (int)$seen > $since; });
+    }
+
+    /**
+     * Whether the node APIs were called from this IP (an IPv6 address by its /64) in the last NODE_DAYS days.
+     */
+    public function seenAsNode(string $ip): bool
+    {
+        return isset($this->nodeNets()[$this->ipNet($ip)]);
+    }
+
+    /**
+     * Tells a node's exit IP, for the 节点 marks: fn(string $ip, ?string $net = null): bool, true for an IP in the node
+     * IP list (node_ip) or one the node APIs were called from in the last NODE_DAYS days. $net: the IP's ip_net, if
+     * known. Reads both once.
+     */
+    public function nodeMatcher(): callable
+    {
+        $listed = RiskIndicator::where('type', 'node_ip')->where('enabled', 1)->pluck('value')->all();
+        $seen = $this->nodeNets();
+        return function (string $ip, ?string $net = null) use ($listed, $seen): bool {
+            if ($net === null) $net = $this->ipNet($ip);
+            if (isset($seen[$net])) return true;
+            foreach ($listed as $entry) {
+                if ($this->risk()->ipMatches($ip, (string)$entry) || $this->risk()->ipRangeWithin($net, (string)$entry)) return true;
+            }
+            return false;
+        };
+    }
+
+    /**
+     * The exit IPs the node APIs were called from in the last NODE_DAYS days that the node IP list does not cover yet,
+     * as [ip_net => last seen], the latest first: offered to be added to it.
+     */
+    public function autoNodes(): array
+    {
+        $listed = RiskIndicator::where('type', 'node_ip')->where('enabled', 1)->pluck('value')->all();
+        $nodes = [];
+        foreach ($this->nodeNets() as $net => $seen) {
+            foreach ($listed as $entry) if ($this->risk()->ipRangeWithin((string)$net, (string)$entry)) continue 2;
+            $nodes[(string)$net] = (int)$seen;
+        }
+        arsort($nodes);
+        return $nodes;
     }
 
     /**

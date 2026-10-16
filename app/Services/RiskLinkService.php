@@ -12,7 +12,8 @@ use Illuminate\Support\Facades\Cache;
 
 /**
  * Links between accounts found in the access log, alerted as risk events (RiskService::recordFinding()) and never acted
- * on: the admin decides. Private IPs, the IP allowlist and the nodes' exit IPs are left out, as IPs shared by design.
+ * on: the admin decides. Private IPs, the allowlists (IP 白名单, 节点 IP) and the IPs the node APIs were called from are
+ * left out, as IPs shared by design.
  * Also the numbers of the daily report.
  */
 class RiskLinkService
@@ -284,11 +285,12 @@ class RiskLinkService
     }
 
     /**
-     * Whether an IP (and its ip_net) is left out of the checks: private or reserved, in the IP allowlist, or a node's.
+     * Whether an IP (and its ip_net) is left out of the checks: private or reserved, in the IP allowlist or the node
+     * IPs, or one the node APIs were called from lately.
      */
     private function excluder(): callable
     {
-        $allow = RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->pluck('value')->all();
+        $allow = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->pluck('value')->all();
         $nodes = $this->access->nodeNets();
         return function (string $ip, string $net) use ($allow, $nodes): bool {
             if (!$this->access->isPublic($ip) || isset($nodes[$net])) return true;
