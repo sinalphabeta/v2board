@@ -32,9 +32,10 @@ class RiskView
 {
     public const TYPES = RiskService::TYPES;
     private const EVENT_TYPES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'identity' => '命中'] + RiskService::FINDING_TYPES;
+    // delete is disabling (the indicator stays), drop is deleting it from the admin panel
     private const ACTIONS = [
-        'add' => '新增', 'edit' => '编辑', 'delete' => '删除', 'mark' => '隔离用户', 'unmark' => '解除隔离', 'setting' => '修改设置',
-        'reset' => '重置订阅', 'exempt' => '今天放行',
+        'add' => '新增', 'edit' => '编辑', 'delete' => '停用', 'drop' => '删除', 'mark' => '隔离用户', 'unmark' => '解除隔离',
+        'setting' => '修改设置', 'reset' => '重置订阅', 'exempt' => '今天放行',
     ];
     // Settings edited on the admin panel (RiskSettings)
     public const SETTINGS = [
@@ -48,7 +49,7 @@ class RiskView
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
     private const FIELDS = ['value' => '值', 'note' => '备注', 'enabled' => '启用'];
     // Audit changes that the action itself already says
-    private const IMPLIED = ['add' => ['value', 'enabled'], 'delete' => ['enabled']];
+    private const IMPLIED = ['add' => ['value', 'enabled'], 'delete' => ['enabled'], 'drop' => ['enabled']];
     private const PAGE_SIZE = 10;
     // What a list says about itself, under its title
     private const LIST_ABOUT = [
@@ -231,7 +232,8 @@ class RiskView
             }, $lines));
         }
         $text .= "\n\n" . $this->escape('回复一条告警或用户卡片发 /add、/del、/search，回复一条告警发 /addip、/delip、/addallow、/addnode，可以不写参数。') .
-            "\n" . $this->escape('用户卡片和告警上的「重置订阅」会换掉订阅链接和 UUID，分享出去的立刻失效；用户本人要重新导入订阅。');
+            "\n" . $this->escape('用户卡片和告警上的「重置订阅」会换掉订阅链接和 UUID，分享出去的立刻失效；用户本人要重新导入订阅。') .
+            "\n" . $this->escape('/del、/delip 这些是停用：名单还在，管理面板里能重新启用；要彻底删掉，在管理面板的风险名单里删。');
         return $this->view($text, [[$this->button('🏠 菜单', 'r:m')]]);
     }
 

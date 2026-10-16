@@ -786,12 +786,35 @@ class RiskService
         }
     }
 
+    /**
+     * Disable an indicator (停用, audited as delete): it stays, and can be enabled again. Disabling an email indicator
+     * releases its users.
+     */
     public function removeIndicator(RiskIndicator $indicator): bool
     {
         $indicator->enabled = 0;
         $ok = $this->saveIndicator($indicator, 'delete');
         if ($ok) $this->refreshEmailIndicator($indicator);
         return $ok;
+    }
+
+    /**
+     * Delete an indicator for good (删除, audited as drop with what it was), enabled or not. Its email's users are
+     * released unless another enabled email indicator matches them; the IP indicators an allowlist entry disabled stay
+     * disabled, as when it is disabled.
+     */
+    public function deleteIndicator(RiskIndicator $indicator): bool
+    {
+        $users = $indicator->type === 'email'
+            ? User::where('risk_indicator_id', $indicator->id)->orWhereRaw('LOWER(TRIM(email)) = ?', [$this->normalizeEmail($indicator->value)])->get()
+            : collect();
+        $was = ['enabled' => [(bool)$indicator->enabled, null]];
+        if ((string)$indicator->note !== '') $was['note'] = [$indicator->note, null];
+        if (!$indicator->delete()) return false;
+        Cache::forget(self::INDICATORS_CACHE_KEY);
+        $this->audit('drop', $indicator, $was);
+        $users->each(function (User $user) { $this->reconcileEmailRisk($user); });
+        return true;
     }
 
     /**

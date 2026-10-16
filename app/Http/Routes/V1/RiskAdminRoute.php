@@ -21,6 +21,7 @@ class RiskAdminRoute
             $router->get('/indicator/fetch', 'V1\\Admin\\RiskController@indicatorFetch');
             $router->post('/indicator/save', 'V1\\Admin\\RiskController@indicatorSave');
             $router->post('/indicator/update', 'V1\\Admin\\RiskController@indicatorUpdate');
+            $router->post('/indicator/drop', 'V1\\Admin\\RiskController@indicatorDrop');
             $router->get('/user/fetch', 'V1\\Admin\\RiskController@userFetch');
             $router->post('/user/isolate', 'V1\\Admin\\RiskController@userIsolate');
             $router->post('/user/release', 'V1\\Admin\\RiskController@userRelease');

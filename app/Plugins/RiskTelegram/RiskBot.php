@@ -162,7 +162,7 @@ class RiskBot
             if ($service->removeIndicator($indicator)) $deleted[] = $value;
         }
         $notes = $type === 'email' && $deleted ? $this->usersLine('🔓 已解除隔离', $deleted, false) : [];
-        $this->reply($message, $this->view->result(['✅ 删除' => $deleted, '⚠️ 不存在' => $missing], $notes), true);
+        $this->reply($message, $this->view->result(['✅ 停用' => $deleted, '⚠️ 不存在' => $missing], $notes), true);
     }
 
     private function runCallback(string $data, $context, RiskOperator $operator): string

@@ -44,9 +44,11 @@ through `RiskService`. Read the code before changing it:
 - `app/Services/RiskService.php`: indicator types (`TYPES`; `allow_ip`, the IP allowlist, and `node_ip`, the nodes'
   exit IPs, are the allowlists in `ALLOW_TYPES`, the others are rules), matching and events (`observe()` from login,
   register and subscription), alerts (`SendRiskTelegramJob`), isolation (an email indicator), adding and changing
-  indicators (`addIndicators()`; `saveIndicatorChecked()` keeps the IP list and the allowlists apart) and the audit log
-  (`v2_risk_audit`; `changes.reason` explains changes made along the way). An alert or event whose IP an IP indicator
-  covers (`ipEntryFor()`, the same IP or a range) offers neither adding it to the IP list nor allowlisting it.
+  indicators (`addIndicators()`; `saveIndicatorChecked()` keeps the IP list and the allowlists apart), disabling them
+  (`removeIndicator()`, 停用, audited as `delete`: the switch and the bot's /del…) and deleting them
+  (`deleteIndicator()`, 删除, audited as `drop`: the admin panel only), and the audit log (`v2_risk_audit`;
+  `changes.reason` explains changes made along the way). An alert or event whose IP an IP indicator covers
+  (`ipEntryFor()`, the same IP or a range) offers neither adding it to the IP list nor allowlisting it.
 - `app/Services/RiskAccessService.php`: the access log `v2_risk_access` (every login, registration, subscription and
   order, one row per day, user, type, result, IP and user agent; an IPv6 address by its /64), the daily subscription
   limit (`guardClient()` in `RiskService`, called from the client middleware), the 10-minute count that alerts 订阅过频

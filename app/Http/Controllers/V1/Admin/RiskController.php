@@ -25,7 +25,8 @@ use Illuminate\Http\Request;
  */
 class RiskController extends Controller
 {
-    private const ACTIONS = ['add', 'edit', 'delete', 'mark', 'unmark', 'setting', 'reset', 'exempt'];
+    // delete: disabled (the switch, the risk bot's /del…); drop: deleted here
+    private const ACTIONS = ['add', 'edit', 'delete', 'drop', 'mark', 'unmark', 'setting', 'reset', 'exempt'];
 
     public function overview()
     {
@@ -237,6 +238,18 @@ class RiskController extends Controller
         return response(['data' => ['disabled' => $disabled]]);
     }
 
+    /**
+     * Delete an indicator for good, enabled or not (the switch only disables it): deleting an enabled email indicator
+     * releases its users, and the IP indicators an allowlist entry disabled stay disabled.
+     */
+    public function indicatorDrop(Request $request)
+    {
+        $indicator = RiskIndicator::find((int)$request->input('id'));
+        if (!$indicator) abort(500, '名单不存在');
+        if (!$this->riskService($request)->deleteIndicator($indicator)) abort(500, '删除失败');
+        return response(['data' => true]);
+    }
+
     public function userFetch(Request $request)
     {
         $query = User::where('risk_status', RiskService::STATUS_RISK);
@@ -299,6 +312,9 @@ class RiskController extends Controller
                 ->get(['id', 'email', 'risk_status'])->keyBy('id');
             $ruleIds = $events->flatMap(function (RiskEvent $event) { return $this->ruleIds($event); })->unique()->values();
             $rules = RiskIndicator::whereIn('id', $ruleIds)->get(['id', 'type', 'value'])->keyBy('id');
+            // Deleted indicators, as their deletion recorded them
+            $dropped = RiskAudit::where('action', 'drop')->whereIn('indicator_id', $ruleIds->diff($rules->keys())->values())
+                ->get(['indicator_id', 'type', 'value'])->keyBy('indicator_id');
             $service = new RiskService();
             $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->pluck('value');
             $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
@@ -306,7 +322,7 @@ class RiskController extends Controller
             $isNode = $service->access()->nodeMatcher();
             $userCounts = $service->recentUserCounts($events->pluck('ip')->all());
             $info = (new IpInfoService())->lookupMany($events->pluck('ip')->all());
-            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $ipRules, $uaRules, $isNode, $userCounts, $info) {
+            return $events->map(function (RiskEvent $event) use ($users, $rules, $dropped, $service, $allowlist, $ipRules, $uaRules, $isNode, $userCounts, $info) {
                 $user = $users->get($event->user_id);
                 return [
                     'id' => $event->id,
@@ -339,9 +355,10 @@ class RiskController extends Controller
                     'occurrences' => (int)$event->occurrences,
                     'first_seen_at' => $event->first_seen_at,
                     'last_seen_at' => $event->last_seen_at,
-                    'rules' => array_map(function ($id) use ($rules) {
-                        $rule = $rules->get($id);
-                        return $rule ? "{$rule->type}:{$rule->value}" : "#{$id}";
+                    'rules' => array_map(function ($id) use ($rules, $dropped) {
+                        $rule = $rules->get($id) ?? $dropped->get($id);
+                        if (!$rule) return "#{$id}";
+                        return "{$rule->type}:{$rule->value}" . ($rules->has($id) ? '' : '（已删除）');
                     }, $this->ruleIds($event)),
                     // What a check found, for the event types in RiskService::FINDING_TYPES
                     'detail' => $event->detail,
