@@ -301,9 +301,11 @@ class RiskController extends Controller
             $rules = RiskIndicator::whereIn('id', $ruleIds)->get(['id', 'type', 'value'])->keyBy('id');
             $service = new RiskService();
             $allowlist = RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->pluck('value');
+            $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
+            $uaRules = RiskIndicator::where('type', 'ua')->where('enabled', 1)->pluck('value');
             $userCounts = $service->recentUserCounts($events->pluck('ip')->all());
             $info = (new IpInfoService())->lookupMany($events->pluck('ip')->all());
-            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $userCounts, $info) {
+            return $events->map(function (RiskEvent $event) use ($users, $rules, $service, $allowlist, $ipRules, $uaRules, $userCounts, $info) {
                 $user = $users->get($event->user_id);
                 return [
                     'id' => $event->id,
@@ -316,11 +318,20 @@ class RiskController extends Controller
                     'ip_allowed' => $allowlist->contains(function ($entry) use ($service, $event) {
                         return $service->ipMatches((string)$event->ip, $entry);
                     }),
+                    // The enabled IP indicator covering the IP now (the same IP or a range): it is listed already
+                    'ip_listed' => $ipRules->first(function ($rule) use ($service, $event) {
+                        return $service->ipMatches((string)$event->ip, trim((string)$rule));
+                    }),
                     // What 放行此 IP adds to the allowlist (an IPv6 address as its /64), null for a private or reserved IP
                     'ip_allow_value' => $service->allowRangeFor((string)$event->ip),
                     // Users of the IP in the last 30 days of risk events: many suggest a CDN or proxy address
                     'ip_users_30d' => $userCounts[$event->ip] ?? 0,
                     'user_agent' => $event->user_agent,
+                    // Whether a UA indicator matches the user agent now (it contains the keyword, in any case)
+                    'ua_listed' => (string)$event->user_agent !== '' && $uaRules->contains(function ($rule) use ($event) {
+                        $rule = trim((string)$rule);
+                        return $rule !== '' && stripos((string)$event->user_agent, $rule) !== false;
+                    }),
                     'occurrences' => (int)$event->occurrences,
                     'first_seen_at' => $event->first_seen_at,
                     'last_seen_at' => $event->last_seen_at,

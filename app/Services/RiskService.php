@@ -166,7 +166,21 @@ class RiskService
      */
     public function allowEntryFor(string $ipOrCidr): ?RiskIndicator
     {
-        return RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->orderBy('id')->get()
+        return $this->entryCovering('allow_ip', $ipOrCidr);
+    }
+
+    /**
+     * The enabled IP indicator that covers this IP or CIDR (the same value or a range containing it), read from the
+     * database: an IP it covers is listed already.
+     */
+    public function ipEntryFor(string $ipOrCidr): ?RiskIndicator
+    {
+        return $this->entryCovering('ip', $ipOrCidr);
+    }
+
+    private function entryCovering(string $type, string $ipOrCidr): ?RiskIndicator
+    {
+        return RiskIndicator::where('type', $type)->where('enabled', 1)->orderBy('id')->get()
             ->first(function (RiskIndicator $entry) use ($ipOrCidr) {
                 return $this->ipRangeWithin($ipOrCidr, $entry->value);
             });

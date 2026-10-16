@@ -280,15 +280,19 @@ class RiskBot
             $this->appendLine($context, "✅ 已处理 · {$context->by} · " . date('m-d H:i'), []);
             return '已标记为已处理';
         }
+        $service = $operator->service();
+        if ($verb === 'w' || $verb === 'W') return $this->allowEventIp($verb === 'W', $event, $user, $context, $service);
+        // The button of an alert sent before the IP was listed, as itself or in a range
+        $listed = $service->ipEntryFor((string)$event->ip);
+        if ($listed) {
+            if ($user) $this->editKeyboard($context, $this->view->alertKeyboard($user, $event));
+            return "这个 IP 已在 IP 名单 {$listed->value} 里";
+        }
         if ($verb === 'p') {
             return $this->askToConfirm($context, "确认把 {$event->ip} 加入 IP 名单", "r:P:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
         }
-        $service = $operator->service();
-        if ($verb === 'w' || $verb === 'W') return $this->allowEventIp($verb === 'W', $event, $user, $context, $service);
         $ip = $service->normalizeIndicatorValue('ip', $event->ip);
         if ($ip === null) return 'IP 无效';
-        $indicator = RiskIndicator::where('type', 'ip')->where('value', $ip)->first();
-        if ($indicator && $indicator->enabled) return '这个 IP 已在名单里';
         try {
             $service->addIndicator('ip', $ip, $user ? "来自告警（uid {$user->id}）" : '来自告警');
         } catch (RiskIpAllowlistedException $e) {
@@ -316,10 +320,15 @@ class RiskBot
         }
         if (!$confirmed) {
             $users = $service->recentUserCounts([$ip])[$ip] ?? 0;
+            // The button of an alert sent before the IP was listed: the entry goes if the range covers it, otherwise
+            // the range lets this IP through
+            $listed = $service->ipEntryFor($ip);
+            $note = !$listed ? '' : ($service->ipRangeWithin($listed->value, $range)
+                ? "IP 名单 {$listed->value} 会停用。\n" : "它在 IP 名单 {$listed->value} 里，放行后只有它不再命中。\n");
             $this->askToConfirm($context, "确认放行 {$range}", "r:W:{$event->id}", "r:x:a:{$event->user_id}:{$event->id}");
             $context->alert = true;
             return '放行 ' . $range . ($range !== $ip ? '（这个 IPv6 地址所在的 /64）' : '') .
-                "：之后它命中 IP、ASN 名单不再告警，关联检测也跳过它；UA、邮箱名单照常。\n最近 30 天有 {$users} 个用户用过这个 IP，" .
+                "：之后它命中 IP、ASN 名单不再告警，关联检测也跳过它；UA、邮箱名单照常。\n{$note}最近 30 天有 {$users} 个用户用过这个 IP，" .
                 '人数多时可能是 CDN、代理或公司、学校的出口。';
         }
         $service->addIndicator('allow_ip', $range, $user ? "来自告警（uid {$user->id}）" : '来自告警', $disabled);

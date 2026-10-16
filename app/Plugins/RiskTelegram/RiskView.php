@@ -302,9 +302,10 @@ class RiskView
     }
 
     /**
-     * Buttons under an alert about a user. A public IP that is not allowlisted can be added to the IP list (unless it
-     * is listed already) or allowlisted, on its own row so as not to be taken for the other. Alerts of what a check
-     * found (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行, 重置订阅.
+     * Buttons under an alert about a user. A public IP in neither the IP list (as itself or in a range) nor the
+     * allowlist can be added to the IP list or allowlisted, on its own row so as not to be taken for the other; one in
+     * a listed range can still be let through by replying /addallow. Alerts of what a check found
+     * (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行, 重置订阅.
      */
     public function alertKeyboard(User $user, ?RiskEvent $event): array
     {
@@ -328,12 +329,13 @@ class RiskView
             }
             if ($finding) $rows[] = $finding;
             $risk = new RiskService();
-            $allowable = $risk->allowRangeFor((string)$event->ip) !== null && !$risk->allowEntryFor((string)$event->ip);
+            $ip = (string)$event->ip;
+            $open = $risk->allowRangeFor($ip) !== null && !$risk->allowEntryFor($ip) && !$risk->ipEntryFor($ip);
             $second = [];
-            if ($allowable && $this->canListIp($event->ip)) $second[] = $this->button('➕ IP 加入名单', "r:p:{$event->id}");
+            if ($open) $second[] = $this->button('➕ IP 加入名单', "r:p:{$event->id}");
             $second[] = $this->button('✅ 已处理', "r:k:{$event->id}");
             $rows[] = $second;
-            if ($allowable) $rows[] = [$this->button('🟢 放行此 IP（白名单）', "r:w:{$event->id}")];
+            if ($open) $rows[] = [$this->button('🟢 放行此 IP（白名单）', "r:w:{$event->id}")];
         }
         return $rows;
     }
@@ -538,13 +540,6 @@ class RiskView
     private function percent(int $part, int $total): string
     {
         return $total ? round($part * 100 / $total) . '%' : '-';
-    }
-
-    private function canListIp($ip): bool
-    {
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return false;
-        $values = array_unique([$ip, (new RiskService())->normalizeIndicatorValue('ip', $ip)]);
-        return !RiskIndicator::where('type', 'ip')->whereIn('value', $values)->where('enabled', 1)->exists();
     }
 
     /**
