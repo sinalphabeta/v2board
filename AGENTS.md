@@ -64,4 +64,5 @@ through `RiskService`. Read the code before changing it:
 
 `webman.php` serves on `tcp://127.0.0.1:6600` with `WebmanHttp`, Adapterman's HTTP protocol wrapped so that a body it
 cannot parse (bad JSON, an empty body sent as JSON) is answered with 400: Adapterman parses it before onMessage, and an
-exception there would stop the whole worker.
+exception there would stop the whole worker. `composer.json` requires `joanhey/adapterman`, so that `update.sh`'s
+`composer update` keeps it (and Workerman) installed.
