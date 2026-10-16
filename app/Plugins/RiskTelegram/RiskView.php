@@ -41,7 +41,7 @@ class RiskView
         'ip_info_enabled' => '告警带 IP 归属', 'asn_cache_ttl' => 'ASN 缓存时间', 'trusted_proxies' => '可信代理',
         'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
         'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
-        'alert_daily_limit' => '每类告警每天上限',
+        'alert_daily_limit' => '每类告警每天上限', 'sub_burst_limit' => '10 分钟订阅次数告警',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
@@ -155,6 +155,8 @@ class RiskView
         $lines[] = '写入失败：今天 ' . $stats['errors_today'] . ' 次' . ($lastError ? $this->escape('，最近一次 ' .
             $this->time($lastError['at'] ?? null, 'm-d H:i')) . ' ' . $this->code($this->shorten($lastError['message'] ?? '', 80)) : '');
         $lines[] = '订阅上限：' . $this->escape($stats['daily_limit'] ? $stats['daily_limit'] . ' 次/天，超过返回 429' : '不限');
+        $burst = (int)RiskSettings::get('sub_burst_limit');
+        $lines[] = '订阅过频：' . $this->escape($burst > 0 ? "10 分钟 {$burst} 次起报（只告警）" : '不检测');
         $lines[] = '节点出口 IP：' . $stats['nodes'] . $this->escape(' 个（' . RiskAccessService::NODE_DAYS . ' 天内调过面板接口的）');
         $lines[] = '关联检测：' . (RiskSettings::get('link_detection') ? '开 · 同 IP ' . (int)RiskSettings::get('link_ip_users') . ' 人起报' : '关') .
             ' · 每晚日报：' . (RiskSettings::get('daily_report') ? '开' : '关');
@@ -321,7 +323,7 @@ class RiskView
             if ($event->event_type === 'sub_limit' && $this->limitedToday($user)) {
                 $finding[] = $this->button('✅ 今天放行', "r:t:a:{$user->id}:{$eventId}");
             }
-            if (in_array($event->event_type, ['sub_limit', 'ip_users'], true)) {
+            if (in_array($event->event_type, ['sub_limit', 'ip_users', 'sub_burst'], true)) {
                 $finding[] = $this->button('♻️ 重置订阅', "r:s:a:{$user->id}:{$eventId}");
             }
             if ($finding) $rows[] = $finding;
@@ -350,6 +352,7 @@ class RiskView
             $this->escape("活跃 {$data['active']} 人 · 订阅 {$data['subscriptions']} 次 · 登录 {$data['logins']}（密码错误 {$data['failed_logins']}）· " .
                 "注册 {$data['registrations']} · 下单 {$data['orders']} · 支付 {$data['paid']}"),
             $this->escape("风险事件 {$data['events']} 条 · 新隔离 {$data['isolated']} 人 · 订阅超限 {$data['limited']} 人 · " .
+                "订阅过频 {$data['bursts']} 人 · " .
                 "关联告警 {$data['link_alerts']} 条" . ($data['merged_alerts'] || $data['skipped_alerts']
                     ? "（合并 {$data['merged_alerts']} 条、超出每天上限没发 {$data['skipped_alerts']} 条）" : '')),
         ];

@@ -28,6 +28,8 @@ class RiskSettings
         'access_log_enabled' => true,
         'access_log_days' => 90,
         'sub_daily_limit' => 0,
+        // A user's subscriptions in 10 minutes that alert (订阅过频, once a day); 0: not checked
+        'sub_burst_limit' => 20,
         'link_detection' => true,
         'link_ip_users' => 3,
         'daily_report' => true,

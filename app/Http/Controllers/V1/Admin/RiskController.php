@@ -130,11 +130,14 @@ class RiskController extends Controller
             'sub_daily_limit' => [0, 100000, '每天订阅上限应该是 0 到 100000 之间的整数，0 表示不限'],
             'link_ip_users' => [2, 50, '同 IP 多用户阈值应该是 2 到 50 之间的整数'],
             'alert_daily_limit' => [5, 500, '每类告警每天上限应该是 5 到 500 之间的整数'],
+            'sub_burst_limit' => [0, 500, '10 分钟订阅次数告警应该是 0（不检测）或 5 到 500 之间的整数'],
         ];
         foreach ($ranges as $name => [$min, $max, $error]) {
             if (!$request->has($name)) continue;
             $value = trim((string)$request->input($name));
             if (!ctype_digit($value) || (int)$value < $min || (int)$value > $max) abort(500, $error);
+            // A handful of updates in 10 minutes is normal (a client started, a few devices)
+            if ($name === 'sub_burst_limit' && (int)$value > 0 && (int)$value < 5) abort(500, $error);
             $values[$name] = (int)$value;
         }
         $service = $this->riskService($request);

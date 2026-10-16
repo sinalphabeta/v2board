@@ -175,6 +175,7 @@ class RiskLinkService
             'isolated' => RiskAudit::where('action', 'mark')->where('created_at', '>=', $from)->where('created_at', '<', $to)
                 ->distinct()->count('user_id'),
             'limited' => RiskEvent::where('event_type', 'sub_limit')->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
+            'bursts' => RiskEvent::where('event_type', 'sub_burst')->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'link_alerts' => RiskEvent::whereIn('event_type', ['ip_users', 'register_link'])
                 ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'skipped_alerts' => $this->risk->skippedAlerts($from),

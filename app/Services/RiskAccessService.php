@@ -127,6 +127,29 @@ class RiskAccessService
         }
     }
 
+    /**
+     * Count a subscription in the user's last 10 minutes (one counter a minute): how many there were, or 0 if Redis is down.
+     */
+    public function countBurst(User $user): int
+    {
+        try {
+            $minute = intdiv(time(), 60);
+            $prefix = 'risk:sub-minute:' . (int)$user->id . ':';
+            Cache::add($prefix . $minute, 0, 11 * 60);
+            Cache::increment($prefix . $minute);
+            $keys = [];
+            for ($i = 0; $i < 10; $i++) $keys[] = $prefix . ($minute - $i);
+            return (int)array_sum(array_map('intval', Cache::many($keys)));
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    public function burstLimit(): int
+    {
+        return max(0, (int)RiskSettings::get('sub_burst_limit'));
+    }
+
     public function subscriptionsToday(User $user): int
     {
         try {

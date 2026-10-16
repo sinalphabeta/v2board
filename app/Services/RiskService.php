@@ -31,7 +31,9 @@ class RiskService
      * Risk events that are not a matched request but something a check found (recordFinding()), with what it found in
      * the event's detail.
      */
-    public const FINDING_TYPES = ['sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联'];
+    public const FINDING_TYPES = [
+        'sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联', 'sub_burst' => '订阅过频',
+    ];
     /**
      * Indicator types. allow_ip is an allowlist: requests from its IPs skip the IP and ASN rules. The others are
      * risk rules (RULE_TYPES): a match is recorded and alerted, and an email match also isolates the user.
@@ -396,6 +398,11 @@ class RiskService
         elseif (!(new UserService())->isAvailable($user)) $result = 'unavailable';
         else $result = 'ok';
         $this->observe($user, 'subscription', $request, false, $result, $count);
+        // Many in a few minutes looks like a script: alerted once a day (not for isolated users, nor those let through)
+        if ($access->burstLimit() > 0 && $result !== 'isolated' && !$access->exempt($user)) {
+            $burst = $access->countBurst($user);
+            if ($burst >= $access->burstLimit()) $this->burstAlert($user, $request, $burst);
+        }
         if (!$limited) return null;
         $this->limitAlert($user, $request, $count);
         return $access->limitResponse();
@@ -472,21 +479,44 @@ class RiskService
     {
         try {
             if (!Cache::add('risk:sub-alerted:' . (int)$user->id . ':' . date('Ymd'), 1, 2 * 86400)) return;
-            $rows = RiskAccess::where('record_at', $this->access()->day(time()))->where('user_id', $user->id)
-                ->where('event_type', RiskAccessService::TYPES['subscription'])->get(['ip_net', 'ua_hash', 'user_agent', 'occurrences']);
-            $clients = $rows->groupBy('ua_hash')->map(function ($rows) {
-                return ['ua' => (string)$rows->first()->user_agent, 'total' => (int)$rows->sum('occurrences')];
-            })->sortByDesc('total')->take(3)->map(function ($client) {
-                $ua = trim(preg_replace('/\s+/', ' ', $client['ua']));
-                return ($ua === '' ? '空 UA' : mb_substr($ua, 0, 30, 'UTF-8')) . ' ×' . $client['total'];
-            })->implode('、');
-            $detail = "今天第 {$count} 次（上限 {$this->access()->dailyLimit()}）· " .
-                $rows->pluck('ip_net')->filter()->unique()->count() . ' 个 IP · 客户端 ' . $clients;
+            $detail = "今天第 {$count} 次（上限 {$this->access()->dailyLimit()}）· " . $this->todaysClients($user);
             $this->recordFinding($user, 'sub_limit', $this->clientIp($request), (string)$request->header('User-Agent', ''), $detail,
                 'sub_limit|' . (int)$user->id . '|' . date('Ymd'));
         } catch (\Throwable $e) {
             // An alert must never change the answer
         }
+    }
+
+    /**
+     * The first time each day the user's subscriptions in 10 minutes reach sub_burst_limit (订阅过频): how many, and
+     * today's IPs and clients.
+     */
+    private function burstAlert(User $user, Request $request, int $count): void
+    {
+        try {
+            if (!Cache::add('risk:sub-burst-alerted:' . (int)$user->id . ':' . date('Ymd'), 1, 2 * 86400)) return;
+            $detail = "10 分钟内 {$count} 次（{$this->access()->burstLimit()} 次起报）· 今天 " . $this->todaysClients($user);
+            $this->recordFinding($user, 'sub_burst', $this->clientIp($request), (string)$request->header('User-Agent', ''), $detail,
+                'sub_burst|' . (int)$user->id . '|' . date('Ymd'));
+        } catch (\Throwable $e) {
+            // An alert must never change the answer
+        }
+    }
+
+    /**
+     * The user's subscriptions today for an alert: N 个 IP · 客户端 the three clients used most, with how many times.
+     */
+    private function todaysClients(User $user): string
+    {
+        $rows = RiskAccess::where('record_at', $this->access()->day(time()))->where('user_id', $user->id)
+            ->where('event_type', RiskAccessService::TYPES['subscription'])->get(['ip_net', 'ua_hash', 'user_agent', 'occurrences']);
+        $clients = $rows->groupBy('ua_hash')->map(function ($rows) {
+            return ['ua' => (string)$rows->first()->user_agent, 'total' => (int)$rows->sum('occurrences')];
+        })->sortByDesc('total')->take(3)->map(function ($client) {
+            $ua = trim(preg_replace('/\s+/', ' ', $client['ua']));
+            return ($ua === '' ? '空 UA' : mb_substr($ua, 0, 30, 'UTF-8')) . ' ×' . $client['total'];
+        })->implode('、');
+        return $rows->pluck('ip_net')->filter()->unique()->count() . ' 个 IP · 客户端 ' . $clients;
     }
 
     public function recordEvent(?User $user, string $eventType, ?Request $request, array $matches = []): void
