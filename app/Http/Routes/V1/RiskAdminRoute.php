@@ -31,6 +31,8 @@ class RiskAdminRoute
             $router->get('/conn/live', 'V1\\Admin\\RiskController@connLive');
             $router->get('/conn/users', 'V1\\Admin\\RiskController@connUsers');
             $router->get('/conn/fetch', 'V1\\Admin\\RiskController@connFetch');
+            $router->get('/conn/probes', 'V1\\Admin\\RiskController@connProbes');
+            $router->post('/conn/probe/drop', 'V1\\Admin\\RiskController@connProbeDrop');
             $router->get('/node/auto', 'V1\\Admin\\RiskController@nodeAuto');
             $router->get('/audit/fetch', 'V1\\Admin\\RiskController@auditFetch');
         });

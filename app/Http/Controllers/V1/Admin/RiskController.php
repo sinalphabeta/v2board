@@ -136,13 +136,16 @@ class RiskController extends Controller
             'alert_daily_limit' => [5, 500, '每类告警每天上限应该是 5 到 500 之间的整数'],
             'sub_burst_limit' => [0, 500, '10 分钟订阅次数告警应该是 0（不检测）或 5 到 500 之间的整数'],
             'conn_log_days' => [7, 365, '连接记录保留天数应该是 7 到 365 之间的整数'],
+            'conn_ip_limit' => [0, 200, '1 小时连接 IP 数告警应该是 0（不检测）或 5 到 200 之间的整数'],
+            'conn_link_ips' => [0, 20, '命中测活 IP 告警应该是 0（不检测）或 1 到 20 之间的整数'],
         ];
         foreach ($ranges as $name => [$min, $max, $error]) {
             if (!$request->has($name)) continue;
             $value = trim((string)$request->input($name));
             if (!ctype_digit($value) || (int)$value < $min || (int)$value > $max) abort(500, $error);
-            // A handful of updates in 10 minutes is normal (a client started, a few devices)
-            if ($name === 'sub_burst_limit' && (int)$value > 0 && (int)$value < 5) abort(500, $error);
+            // A handful of updates in 10 minutes is normal (a client started, a few devices), and a few IPs in an hour
+            // (home, office, a phone moving)
+            if (in_array($name, ['sub_burst_limit', 'conn_ip_limit'], true) && (int)$value > 0 && (int)$value < 5) abort(500, $error);
             $values[$name] = (int)$value;
         }
         $service = $this->riskService($request);
@@ -478,8 +481,9 @@ class RiskController extends Controller
 
     /**
      * The connection log by user, the most sources first: each user's sources in a date range (see connRange()), with
-     * how spread they are (RiskConnService::summarize()) and the nodes. The other filters (a user, an IP, see
-     * connFilter()) pick the users, whose sources all count.
+     * how spread they are (RiskConnService::summarize()), the nodes and how many are probing IPs (probe_hits, null
+     * for the users isolated now: theirs are the probing IPs). The other filters (a user, an IP, see connFilter())
+     * pick the users, whose sources all count.
      */
     public function connUsers(Request $request)
     {
@@ -502,22 +506,27 @@ class RiskController extends Controller
         $summaries = [];
         foreach ($rows as $userId => $userRows) $summaries[$userId] = $conn->summarize($userRows, $info);
         $servers = $conn->servers(array_merge([], ...array_column($summaries, 'nodes')));
-        return response(['data' => $page->map(function ($row) use ($users, $summaries, $servers) {
+        $probes = $conn->probeUsers($rows->flatten(1)->pluck('ip_net')->filter()->unique()->values()->all());
+        return response(['data' => $page->map(function ($row) use ($users, $summaries, $servers, $rows, $probes) {
             $user = $users->get($row->user_id);
+            $isolated = $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false;
             $summary = $summaries[$row->user_id] ?? [];
+            $nets = $rows->get($row->user_id, collect())->pluck('ip_net')->unique();
             return [
                 'user_id' => (int)$row->user_id,
                 'email' => $user ? $user->email : null,
-                'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
+                'user_isolated' => $isolated,
                 'reports' => (int)$row->reports,
                 'servers' => array_values(array_intersect_key($servers, array_flip($summary['nodes'] ?? []))),
+                'probe_hits' => $isolated ? null : $nets->filter(function ($net) use ($probes) { return isset($probes[$net]); })->count(),
             ] + array_diff_key($summary, ['nodes' => 1]);
         })->values(), 'total' => $total]);
     }
 
     /**
      * The connection log, the latest first, like accessFetch(): a date range (see connRange()) and the other filters
-     * (see connFilter()). Each row says whether a list covers its source now. Pages of at most 100 rows.
+     * (see connFilter()). Each row says whether a list covers its source now, whether it is shared, and which users
+     * isolated now connected from it too (a probing IP). Pages of at most 100 rows.
      */
     public function connFetch(Request $request)
     {
@@ -531,12 +540,17 @@ class RiskController extends Controller
             $info = (new IpInfoService())->lookupMany($rows->pluck('ip')->unique()->values()->all());
             $isNode = (new RiskAccessService())->nodeMatcher();
             $servers = $conn->servers($rows->flatMap(function (RiskConn $row) { return array_filter(explode(',', (string)$row->servers)); })->all());
+            $nets = $rows->pluck('ip_net')->filter()->unique()->values()->all();
+            $shared = $conn->sharedNets($nets);
+            $probes = $conn->probeUsers($nets);
+            $emails = User::whereIn('id', array_merge([], ...array_map('array_keys', array_values($probes))))->pluck('email', 'id');
             $service = new RiskService();
             $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->get();
             $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
-            return $rows->map(function (RiskConn $row) use ($users, $info, $isNode, $servers, $service, $allowlist, $ipRules) {
+            return $rows->map(function (RiskConn $row) use ($users, $info, $isNode, $servers, $shared, $probes, $emails, $service, $allowlist, $ipRules) {
                 $user = $users->get($row->user_id);
                 $source = $row->ip_net !== '';
+                $owners = array_diff(array_keys($probes[$row->ip_net] ?? []), [(int)$row->user_id]);
                 return [
                     // The primary key, for the table's row key
                     'key' => implode('|', [$row->record_at, $row->user_id, $row->ip_net]),
@@ -556,6 +570,11 @@ class RiskController extends Controller
                     'ip_listed' => $source ? $ipRules->first(function ($rule) use ($service, $row) {
                         return $service->ipRangeWithin((string)$row->ip_net, trim((string)$rule));
                     }) : null,
+                    // The users not isolated who connected from it in the last 7 days, when that many share it (a relay
+                    // not in the node IPs yet, a carrier's NAT): the checks leave it out; else 0
+                    'shared' => (int)($shared[$row->ip_net] ?? 0),
+                    // The other users isolated now who connected from it: a probing IP
+                    'probe_users' => array_map(function ($id) use ($emails) { return ['id' => $id, 'email' => $emails[$id] ?? null]; }, array_values($owners)),
                     // The row that takes a user's sources over the daily limit
                     'overflow' => !$source,
                     'servers' => array_values(array_intersect_key($servers, array_flip(array_filter(explode(',', (string)$row->servers))))),
@@ -565,6 +584,43 @@ class RiskController extends Controller
                 ] + $this->ipInfoFields($info[$row->ip] ?? null);
             })->values();
         }, 100);
+    }
+
+    /**
+     * The probing IPs (RiskConnService::probes()), the latest first, with the isolated users' emails, the nodes'
+     * names and where they are; ip: that source only. Pages of at most 100.
+     */
+    public function connProbes(Request $request)
+    {
+        $conn = new RiskConnService();
+        $ip = trim((string)$request->input('ip', ''));
+        if ($ip !== '' && !filter_var($ip, FILTER_VALIDATE_IP)) abort(500, 'IP 格式有误');
+        $current = max(1, (int)$request->input('current', 1));
+        $pageSize = min(100, max(10, (int)$request->input('pageSize', 10)));
+        [$rows, $total] = $conn->probes($current, $pageSize, $ip === '' ? null : $ip);
+        $emails = User::whereIn('id', array_merge([], ...array_column($rows, 'users')))->pluck('email', 'id');
+        $servers = $conn->servers(array_merge([], ...array_column($rows, 'nodes')));
+        $info = $rows ? (new IpInfoService())->lookupMany(array_column($rows, 'ip')) : [];
+        return response(['data' => array_map(function (array $row) use ($emails, $servers, $info) {
+            return array_merge($row, [
+                'users' => array_map(function ($id) use ($emails) { return ['id' => $id, 'email' => $emails[$id] ?? null]; }, $row['users']),
+                'servers' => array_values(array_intersect_key($servers, array_flip($row['nodes']))),
+            ], $this->ipInfoFields($info[$row['ip']] ?? null));
+        }, $rows), 'total' => $total]);
+    }
+
+    /**
+     * Delete a probing IP (ip_net: an IP, or an IPv6 /64): its rows of the users isolated now. Audited as drop.
+     */
+    public function connProbeDrop(Request $request)
+    {
+        $net = trim((string)$request->input('ip_net', ''));
+        $address = explode('/', $net)[0];
+        if (!filter_var($address, FILTER_VALIDATE_IP) || $net !== (new RiskAccessService())->ipNet($address)) abort(500, 'IP 格式有误');
+        $users = (new RiskConnService())->dropProbe($net);
+        if ($users === null) abort(500, '这不是测活 IP');
+        $this->riskService($request)->auditProbeDrop($net, $users);
+        return response(['data' => true]);
     }
 
     /**

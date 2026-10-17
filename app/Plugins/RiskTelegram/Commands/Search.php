@@ -30,8 +30,8 @@ class Search extends RiskCommand
             $bot->replyView($message, $bot->view()->userCard($users->first()));
             return;
         }
-        // For an IP, what each of its users did from it
-        $usage = filter_var($query, FILTER_VALIDATE_IP) ? ($service->ipUsage([$query], $service->searchDays())[$query] ?? []) : [];
+        // For an IP, what each of its users did from it, connecting to the nodes too
+        $usage = filter_var($query, FILTER_VALIDATE_IP) ? $service->searchUsage($query) : [];
         $bot->replyView($message, $bot->view()->searchResults($users, $query, $usage));
     }
 }

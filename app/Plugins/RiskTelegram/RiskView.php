@@ -5,12 +5,14 @@ namespace App\Plugins\RiskTelegram;
 use App\Models\Plan;
 use App\Models\RiskAccess;
 use App\Models\RiskAudit;
+use App\Models\RiskConn;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\ServerGroup;
 use App\Models\User;
 use App\Services\IpInfoService;
 use App\Services\RiskAccessService;
+use App\Services\RiskConnService;
 use App\Services\RiskService;
 use App\Services\RiskSettings;
 
@@ -20,7 +22,8 @@ use App\Services\RiskSettings;
  * Button callback data, at most 64 bytes:
  *   r:m  menu · r:u:<page> isolated users · r:e:<page> recent events · r:l:<type>:<page> indicators
  *   r:a:<page> audit log · r:h status · r:d today's report · r:c:<uid> user card · r:cr:<uid> user card as a new reply
- *   r:ue:<uid>:<s|l|o|k>:<page> a user's subscriptions, logins, orders or old links (the access log)
+ *   r:ue:<uid>:<s|l|o|k|n>:<page> a user's subscriptions, logins, orders or old links (the access log), or n: the
+ *   connection log · r:cnr:<uid> the connection log as a new reply
  *   r:n:<ip> the users of an IP, as a new reply (the IP's colons as dashes: the data is split at colons)
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
  *   r:s|t:<ctx>:<uid>:<eid> ask to reset the subscription / let it through today, r:S|T:… do it
@@ -31,6 +34,8 @@ use App\Services\RiskSettings;
 class RiskView
 {
     public const TYPES = RiskService::TYPES;
+    // What else the audit log records changes to
+    private const AUDIT_TYPES = ['probe_ip' => '测活 IP'];
     private const EVENT_TYPES = ['subscription' => '订阅', 'login' => '登录', 'register' => '注册', 'identity' => '命中'] + RiskService::FINDING_TYPES;
     // delete is disabling (the indicator stays), drop is deleting it from the admin panel
     private const ACTIONS = [
@@ -44,7 +49,8 @@ class RiskView
         'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
         'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
         'alert_daily_limit' => '每类告警每天上限', 'sub_burst_limit' => '10 分钟订阅次数告警',
-        'conn_log_enabled' => '连接记录', 'conn_log_days' => '连接记录保留天数',
+        'conn_log_enabled' => '连接记录', 'conn_log_days' => '连接记录保留天数', 'conn_ip_limit' => '1 小时连接 IP 数告警',
+        'conn_link_ips' => '命中测活 IP 告警',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
@@ -52,6 +58,8 @@ class RiskView
     // Audit changes that the action itself already says
     private const IMPLIED = ['add' => ['value', 'enabled'], 'delete' => ['enabled'], 'drop' => ['enabled']];
     private const PAGE_SIZE = 10;
+    // The sources a user's 连接记录 shows (the last 24 hours, the latest first)
+    private const CONN_SHOWN = 15;
     // What a list says about itself, under its title
     private const LIST_ABOUT = [
         'allow_ip' => '这些 IP 命中 IP、ASN 名单不告警，UA、邮箱名单照常',
@@ -278,6 +286,8 @@ class RiskView
             $lines[] = '重置后旧链接: ' . $this->escape('近 ' . RiskAccessService::OLD_LINK_DAYS . " 天 {$old[0]} 次 · {$old[1]} 个 IP · 最后 " .
                 $this->time($old[2]));
         }
+        $connected = (new RiskConnService())->today($user);
+        if ($connected) $lines[] = '连接节点: ' . $this->escape("今天 {$connected[0]} 个 IP（{$connected[1]} 个网段）");
         $lines = array_merge($lines, [
             '',
             '*最近订阅*',
@@ -301,7 +311,9 @@ class RiskView
             $this->button('🛒 下单记录', "r:ue:{$user->id}:o:1"),
         ];
         // Clients still updating with a link from before a reset: the user's own, or whoever it was shared with
-        if ((new RiskAccessService())->oldLinks($user)) $rows[] = [$this->button('🔗 旧链接记录', "r:ue:{$user->id}:k:1")];
+        $more = [$this->button('📡 连接记录', "r:ue:{$user->id}:n:1")];
+        if ((new RiskAccessService())->oldLinks($user)) $more[] = $this->button('🔗 旧链接记录', "r:ue:{$user->id}:k:1");
+        $rows[] = $more;
         $rows[] = [$this->button('🏠 菜单', 'r:m')];
         return $rows;
     }
@@ -312,6 +324,7 @@ class RiskView
      */
     public function userEvents(User $user, string $kind, int $page): array
     {
+        if ($kind === 'n') return $this->userConns($user);
         $kinds = ['s' => ['subscription', '📜 *订阅记录*'], 'l' => ['login', '🔑 *登录记录*'], 'o' => ['order', '🛒 *下单记录*'],
             'k' => ['old_link', '🔗 *旧链接记录*']];
         [$type, $title] = $kinds[$kind] ?? $kinds['s'];
@@ -325,7 +338,33 @@ class RiskView
     }
 
     /**
-     * Users found for a query; for an IP with what each did from it ($usage: see RiskService::ipUsage()).
+     * The IPs the user connected to the nodes from in the last 24 hours (the connection log), the latest CONN_SHOWN,
+     * with where they are, the nodes and when. $reply: sent apart, from an alert, with no way back to the card.
+     */
+    public function userConns(User $user, bool $reply = false): array
+    {
+        $conn = new RiskConnService();
+        [$rows, $total] = $conn->recent($user, self::CONN_SHOWN);
+        $info = $rows->count() ? (new IpInfoService())->lookupMany($rows->pluck('ip')->unique()->values()->all()) : [];
+        $servers = $conn->servers($rows->flatMap(function (RiskConn $row) { return array_filter(explode(',', (string)$row->servers)); })->all());
+        $isNode = (new RiskAccessService())->nodeMatcher();
+        $lines = $rows->map(function (RiskConn $row) use ($info, $servers, $isNode) {
+            if ($row->ip_net === '') return '• ' . $this->escape('超出每天上限的其他 IP · 最后 ' . $this->time($row->last_seen_at) . " · {$row->reports} 次");
+            $where = trim(($info[$row->ip]['location'] ?? '') . ' ' . ($info[$row->ip]['network'] ?? ''));
+            $nodes = array_map(function ($key) use ($servers) {
+                return ($servers[$key]['name'] ?? null) ?: $key;
+            }, array_filter(explode(',', (string)$row->servers)));
+            return '• ' . $this->code($row->ip) . ($isNode((string)$row->ip, (string)$row->ip_net) ? $this->escape(' 🛰 节点') : '') .
+                $this->escape(($where !== '' ? " {$where}" : '') . ' · ' . $this->shorten(implode('、', $nodes), 40) . ' · 最后 ' .
+                    $this->time($row->last_seen_at) . " · {$row->reports} 次");
+        })->implode("\n");
+        $text = '📡 *连接记录* ' . $this->code($user->email) . "\n" . $this->escape("最近 24 小时 {$total} 个 IP（IPv6 按 /64）" .
+            ($total > $rows->count() ? "，显示最近 {$rows->count()} 个" : '')) . "\n\n" . ($lines !== '' ? $lines : '暂无');
+        return $this->view($text, $reply ? [] : [[$this->button('👤 返回用户', "r:c:{$user->id}")]]);
+    }
+
+    /**
+     * Users found for a query; for an IP with what each did from it ($usage: see RiskService::searchUsage()).
      */
     public function searchResults($users, string $query, array $usage = []): array
     {
@@ -364,13 +403,18 @@ class RiskView
         ]];
         if ($event) {
             $finding = [];
-            if (in_array($event->event_type, ['ip_users', 'register_link'], true) && filter_var($event->ip, FILTER_VALIDATE_IP)) {
+            if (in_array($event->event_type, ['ip_users', 'register_link', 'conn_link'], true) && filter_var($event->ip, FILTER_VALIDATE_IP)) {
                 $finding[] = $this->button('🔎 这个 IP 的用户', 'r:n:' . str_replace(':', '-', (string)$event->ip));
+            }
+            if (in_array($event->event_type, ['conn_ips', 'conn_link'], true)) $finding[] = $this->button('📡 连接记录', "r:cnr:{$user->id}");
+            // The isolated user whose probing IP it was
+            if ($event->event_type === 'conn_link' && preg_match('/已隔离用户 uid (\d+)/u', (string)$event->detail, $owner)) {
+                $finding[] = $this->button('👤 被隔离的 uid ' . $owner[1], "r:cr:{$owner[1]}");
             }
             if ($event->event_type === 'sub_limit' && $this->limitedToday($user)) {
                 $finding[] = $this->button('✅ 今天放行', "r:t:a:{$user->id}:{$eventId}");
             }
-            if (in_array($event->event_type, ['sub_limit', 'ip_users', 'sub_burst'], true)) {
+            if (in_array($event->event_type, ['sub_limit', 'ip_users', 'sub_burst', 'conn_ips'], true)) {
                 $finding[] = $this->button('♻️ 重置订阅', "r:s:a:{$user->id}:{$eventId}");
             }
             if ($finding) $rows[] = $finding;
@@ -403,7 +447,7 @@ class RiskView
                 "注册 {$data['registrations']} · 下单 {$data['orders']} · 支付 {$data['paid']}"),
             $this->escape("风险事件 {$data['events']} 条 · 新隔离 {$data['isolated']} 人 · 订阅超限 {$data['limited']} 人 · " .
                 "订阅过频 {$data['bursts']} 人 · " .
-                "关联告警 {$data['link_alerts']} 条" . ($data['merged_alerts'] || $data['skipped_alerts']
+                "关联告警 {$data['link_alerts']} 条 · 连接告警 " . ($data['conn_alerts'] ?? 0) . ' 条' . ($data['merged_alerts'] || $data['skipped_alerts']
                     ? "（合并 {$data['merged_alerts']} 条、超出每天上限没发 {$data['skipped_alerts']} 条）" : '')),
         ];
         $users = [];
@@ -433,6 +477,9 @@ class RiskView
             '旧链接还在被拉' => array_map(function ($row) use ($user) {
                 return $user($row) . $this->escape(" {$row['total']} 次 · {$row['ips']} 个 IP");
             }, $data['old_links'] ?? []),
+            '连接 IP 最多' => array_map(function ($row) use ($user) {
+                return $user($row) . $this->escape(" {$row['sources']} 个 IP · {$row['segments']} 个网段 · {$row['provinces']} 个地区");
+            }, $data['conn_top'] ?? []),
         ];
         foreach ($sections as $name => $rows) {
             if ($rows) $lines[] = "\n*" . $this->escape($name) . "*\n" . implode("\n", $rows);
@@ -472,7 +519,7 @@ class RiskView
         if ($row->user_id) $parts[] = 'uid ' . $this->code((int)$row->user_id);
         $parts[] = $row->action === 'setting'
             ? $this->escape('设置 ' . (self::SETTINGS[$row->value] ?? $row->value))
-            : $this->escape(self::TYPES[$row->type] ?? $row->type) . ' ' . $this->code($this->shorten($row->value, 60));
+            : $this->escape(self::TYPES[$row->type] ?? self::AUDIT_TYPES[$row->type] ?? $row->type) . ' ' . $this->code($this->shorten($row->value, 60));
         $parts[] = $this->actor($row);
         $line = implode(' \\| ', $parts);
         $changes = [];
@@ -480,6 +527,10 @@ class RiskView
             if (!isset(self::FIELDS[$field]) || in_array($field, self::IMPLIED[$row->action] ?? [], true)) continue;
             $changes[] = self::FIELDS[$field] . ': ' . $this->changeValue($field, $change[0] ?? null) .
                 ' → ' . $this->changeValue($field, $change[1] ?? null);
+        }
+        // A probing IP deleted: the isolated users whose connection log rows went
+        if ($row->type === 'probe_ip' && is_array($row->changes['users'][0] ?? null)) {
+            $changes[] = '删掉了 ' . implode('、', array_map(function ($id) { return 'uid ' . $this->code((int)$id); }, $row->changes['users'][0])) . ' 的连接记录';
         }
         // Why the system made the change, e.g. an IP indicator disabled by the allowlist entry covering it
         $reason = $row->changes['reason'] ?? null;
@@ -573,6 +624,7 @@ class RiskView
         foreach (RiskAccessService::TYPE_NAMES as $type => $name) {
             if (!empty($usage[$type])) $parts[] = "{$name} {$usage[$type]} 次";
         }
+        if (!empty($usage['connect'])) $parts[] = "连接节点 {$usage['connect']} 次";
         if (!empty($usage['last_seen_at'])) $parts[] = '最后 ' . $this->time($usage['last_seen_at']);
         return implode(' · ', $parts);
     }

@@ -33,6 +33,8 @@ class RiskService
      */
     public const FINDING_TYPES = [
         'sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联', 'sub_burst' => '订阅过频',
+        // From the connection log (RiskConnService)
+        'conn_ips' => '连接 IP 过多', 'conn_link' => '命中测活 IP',
     ];
     /**
      * Indicator types. allow_ip and node_ip are allowlists (ALLOW_TYPES). The others are risk rules (RULE_TYPES): a
@@ -336,13 +338,27 @@ class RiskService
         if ($query === '') return collect();
         if (ctype_digit($query)) return User::where('id', (int)$query)->get();
         if (filter_var($query, FILTER_VALIDATE_IP)) {
-            $usage = $this->ipUsage([$query], $this->searchDays())[$query] ?? [];
+            $usage = $this->searchUsage($query);
             uasort($usage, function ($a, $b) { return ($b['last_seen_at'] ?? 0) <=> ($a['last_seen_at'] ?? 0); });
             $ids = array_slice(array_keys($usage), 0, $limit);
             $users = User::whereIn('id', $ids)->get()->keyBy('id');
             return collect($ids)->map(function ($id) use ($users) { return $users->get($id); })->filter()->values();
         }
         return User::where('email', $this->normalizeEmail($query))->get();
+    }
+
+    /**
+     * What each user did from an IP for /search and an alert's 这个 IP 的用户: ipUsage() and who connected to the
+     * nodes from it (the connection log, 'connect'), within searchDays().
+     */
+    public function searchUsage(string $ip): array
+    {
+        $usage = $this->ipUsage([$ip], $this->searchDays())[$ip] ?? [];
+        foreach ((new RiskConnService($this))->usage([$ip], $this->searchDays())[$ip] ?? [] as $userId => $connected) {
+            $usage[$userId]['connect'] = $connected['connect'];
+            $usage[$userId]['last_seen_at'] = max((int)($usage[$userId]['last_seen_at'] ?? 0), $connected['last_seen_at']);
+        }
+        return $usage;
     }
 
     /**
@@ -969,6 +985,21 @@ class RiskService
                 'actor_type' => $this->actor['type'], 'actor_id' => $this->actor['id'], 'actor_ip' => $this->actor['ip'],
                 'action' => 'setting', 'type' => 'setting', 'value' => $name,
                 'changes' => ['value' => [$mask($old), $mask($new)]], 'created_at' => time()
+            ]);
+        } catch (\Throwable $e) { }
+    }
+
+    /**
+     * Audit a probing IP deleted from the connection log (RiskConnService::dropProbe()): the source and the isolated
+     * users whose rows went.
+     */
+    public function auditProbeDrop(string $ipNet, array $userIds): void
+    {
+        try {
+            RiskAudit::create([
+                'actor_type' => $this->actor['type'], 'actor_id' => $this->actor['id'], 'actor_ip' => $this->actor['ip'],
+                'action' => 'drop', 'type' => 'probe_ip', 'value' => $ipNet,
+                'changes' => ['users' => [$userIds, null]], 'created_at' => time(),
             ]);
         } catch (\Throwable $e) { }
     }

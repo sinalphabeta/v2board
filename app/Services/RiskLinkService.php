@@ -155,8 +155,10 @@ class RiskLinkService
             ->groupBy('user_id')->orderByDesc('ips')->orderByDesc('total')->limit(5)->get();
         $shared = array_slice($this->sharedIps($day), 0, 5);
         $regions = $this->regions($day);
+        $connTop = (new RiskConnService($this->risk))->top($day);
         $ids = $top->pluck('user_id')->merge($failed->pluck('user_id'))->merge($scripts->pluck('user_id'))
-            ->merge(array_column($regions, 'user_id'))->merge($oldLinks->pluck('user_id'))->unique()->values();
+            ->merge(array_column($regions, 'user_id'))->merge($oldLinks->pluck('user_id'))->merge(array_column($connTop, 'user_id'))
+            ->unique()->values();
         $emails = User::whereIn('id', $ids)->pluck('email', 'id');
         $email = function ($id) use ($emails) { return $emails[$id] ?? null; };
         $info = $shared ? (new IpInfoService())->lookupMany(array_column($shared, 'ip')) : [];
@@ -178,6 +180,8 @@ class RiskLinkService
             'limited' => RiskEvent::where('event_type', 'sub_limit')->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'bursts' => RiskEvent::where('event_type', 'sub_burst')->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'link_alerts' => RiskEvent::whereIn('event_type', ['ip_users', 'register_link'])
+                ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
+            'conn_alerts' => RiskEvent::whereIn('event_type', ['conn_ips', 'conn_link'])
                 ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'skipped_alerts' => $this->risk->skippedAlerts($from),
             'merged_alerts' => $this->risk->alerts()->dayCounts($from)['merged'],
@@ -204,6 +208,8 @@ class RiskLinkService
             'old_links' => $oldLinks->map(function ($row) use ($email) {
                 return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'total' => (int)$row->total, 'ips' => (int)$row->ips];
             })->all(),
+            // The users who connected to the nodes from the most IPs (the connection log)
+            'conn_top' => array_map(function ($row) use ($email) { return $row + ['email' => $email($row['user_id'])]; }, $connTop),
             'table_rows' => $stats['table_rows'],
             'table_bytes' => $stats['table_bytes'],
             'days' => $stats['days'],

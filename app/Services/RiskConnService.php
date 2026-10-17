@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\RiskConn;
+use App\Models\RiskIndicator;
 use App\Models\ServerAnytls;
 use App\Models\ServerHysteria;
 use App\Models\ServerShadowsocks;
@@ -37,6 +38,10 @@ class RiskConnService
     public const ISOLATED_DAILY_SOURCES = 5000;
     // Online: reported in the last 3 minutes (the nodes report every minute by default)
     public const ONLINE_SECONDS = 180;
+    // A source that this many users not isolated connected from in SHARED_DAYS days is shared (a relay not in the node
+    // IPs yet, a carrier's NAT, an office): the checks leave it out
+    public const SHARED_USERS = 5;
+    public const SHARED_DAYS = 7;
     // Filtering by place looks up where this many sources are at most (500 take about 25 ms): it is not stored
     public const PLACE_LOOKUPS = 10000;
     private const BUFFER_KEY = 'risk:conn:buffer';
@@ -346,6 +351,273 @@ class RiskConnService
             }
         }
         return $servers;
+    }
+
+    /**
+     * risk:scan, every 10 minutes: alert users with many sources in the last hour (conn_ips) and users connecting from
+     * the probing IPs (conn_link); each check fails alone. Only alerted, never acted on. Returns how many were alerted.
+     */
+    public function scan(): int
+    {
+        if (!$this->enabled()) return 0;
+        $alerted = 0;
+        foreach (['scanSources', 'scanProbes'] as $check) {
+            try {
+                $alerted += $this->{$check}();
+            } catch (\Throwable $e) {
+                report($e);
+            }
+        }
+        return $alerted;
+    }
+
+    /**
+     * 连接 IP 过多: a user (not isolated, not an admin) with conn_ip_limit or more sources in the last hour, in at
+     * least half as many segments (a phone's carrier changes its address within one or two), left-out and shared
+     * sources aside. Where they are is only written in the alert.
+     */
+    private function scanSources(): int
+    {
+        $limit = (int)RiskSettings::get('conn_ip_limit');
+        if ($limit <= 0) return 0;
+        $since = time() - 3600;
+        $recent = function () use ($since) {
+            return RiskConn::whereIn('record_at', array_unique([$this->access()->day($since), $this->access()->day(time())]))
+                ->where('last_seen_at', '>=', $since)->where('ip_net', '!=', '');
+        };
+        $ids = $recent()->groupBy('user_id')->havingRaw('COUNT(DISTINCT ip_net) >= ?', [$limit])->pluck('user_id')->all();
+        $users = $ids ? User::whereIn('id', $ids)->where('risk_status', '!=', RiskService::STATUS_RISK)->where('is_admin', 0)->get()->keyBy('id') : collect();
+        if (!$users->count()) return 0;
+        $rows = $recent()->whereIn('user_id', $users->keys()->all())->get();
+        $exclude = $this->risk()->links()->excluder();
+        $shared = $this->sharedNets($rows->pluck('ip_net')->unique()->values()->all());
+        $alerted = 0;
+        foreach ($rows->groupBy('user_id') as $userId => $userRows) {
+            $kept = $userRows->reject(function (RiskConn $row) use ($exclude, $shared) {
+                return isset($shared[$row->ip_net]) || $exclude((string)$row->ip, (string)$row->ip_net);
+            });
+            $info = (new IpInfoService())->lookupMany($kept->pluck('ip')->unique()->values()->all());
+            $summary = $this->summarize($kept, $info);
+            if ($summary['sources'] < $limit || $summary['segments'] < (int)ceil($limit / 2)) continue;
+            $networks = $kept->map(function (RiskConn $row) use ($info) { return $info[$row->ip]['network'] ?? null; })->filter()->unique()->count();
+            $names = array_filter(array_column($this->servers($summary['nodes']), 'name'));
+            $latest = $kept->sortByDesc('last_seen_at');
+            $examples = $latest->unique('ip_net')->take(3)->map(function (RiskConn $row) use ($info) {
+                return trim($row->ip . ' ' . $this->where($info[$row->ip] ?? null));
+            })->implode('、');
+            $detail = "1 小时内 {$summary['sources']} 个 IP（{$summary['segments']} 个网段，{$summary['brief']} 个只出现了一两分钟）· "
+                . "{$summary['provinces']} 个地区、{$networks} 个运营商 · 节点 " . (implode('、', array_slice($names, 0, 3)) ?: '-') . " · {$examples}";
+            if ($this->recordOnce($users->get($userId), 'conn_ips', (string)$latest->first()->ip, $detail)) $alerted++;
+        }
+        return $alerted;
+    }
+
+    /**
+     * 命中测活 IP: a user (not isolated, not an admin) connecting today from conn_link_ips or more probing IPs (see
+     * probeUsers()); under the link checks' switch.
+     */
+    private function scanProbes(): int
+    {
+        $threshold = (int)RiskSettings::get('conn_link_ips');
+        if ($threshold <= 0 || !RiskSettings::get('link_detection')) return 0;
+        // Today's sources of users not isolated that an isolated user connected from too
+        $rows = RiskConn::where('record_at', $this->access()->day(time()))->where('ip_net', '!=', '')
+            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->select('id'))
+            ->whereExists(function ($query) {
+                $query->select(DB::raw(1))->from('v2_risk_conn as probe')->join('v2_user as owner', 'owner.id', '=', 'probe.user_id')
+                    ->whereColumn('probe.ip_net', 'v2_risk_conn.ip_net')->where('owner.risk_status', RiskService::STATUS_RISK);
+            })->get();
+        if (!$rows->count()) return 0;
+        $probes = $this->probeUsers($rows->pluck('ip_net')->unique()->values()->all());
+        $users = User::whereIn('id', $rows->pluck('user_id')->unique()->values())->where('is_admin', 0)->get()->keyBy('id');
+        $alerted = 0;
+        foreach ($rows->groupBy('user_id') as $userId => $userRows) {
+            $hits = $userRows->filter(function (RiskConn $row) use ($probes) { return isset($probes[$row->ip_net]); })->unique('ip_net')->values();
+            if (!$users->has($userId) || $hits->count() < $threshold) continue;
+            $detail = '今天 ' . $hits->count() . ' 个连接 IP 是测活 IP：' . $hits->take(3)->map(function (RiskConn $row) use ($probes) {
+                $by = $probes[$row->ip_net];
+                arsort($by);
+                $owner = array_key_first($by);
+                return $row->ip_net . (strpos($row->ip_net, ':') !== false ? '（IPv6 /64）' : '（IPv4）') .
+                    " 被已隔离用户 uid {$owner} 用过，最后 " . date('m-d', $by[$owner]);
+            })->implode('；');
+            if ($this->recordOnce($users->get($userId), 'conn_link', (string)$hits->first()->ip, $detail)) $alerted++;
+        }
+        return $alerted;
+    }
+
+    /**
+     * Record a finding about the user, alerted once in 24 hours (not by the date: a check before and after midnight
+     * would alert twice); later scans update the same event quietly. Returns whether it alerted.
+     */
+    private function recordOnce(User $user, string $type, string $ip, string $detail): bool
+    {
+        $key = "risk:conn:{$type}:" . (int)$user->id;
+        // Which alert the later scans update: its time and a random part, as two may come within a second
+        $alerted = time() . ':' . bin2hex(random_bytes(4));
+        $alert = Cache::add($key, $alerted, 86400);
+        if (!$alert) $alerted = (string)Cache::get($key, $alerted);
+        $this->risk()->recordFinding($user, $type, $ip, '', $detail, "{$type}|{$user->id}|{$alerted}", $alert);
+        return $alert;
+    }
+
+    /**
+     * Which of these sources are probing IPs, by whom: [ip_net => [user_id => last seen]] for the sources that users
+     * isolated now connected from (ever, their rows are kept), less those left out (allowlisted, node IPs) or shared.
+     */
+    public function probeUsers(array $nets): array
+    {
+        if (!$nets) return [];
+        $rows = RiskConn::whereIn('ip_net', $nets)->whereIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->select('id'))
+            ->selectRaw('ip_net, user_id, MAX(ip) AS ip, MAX(last_seen_at) AS last_seen_at')->groupBy('ip_net', 'user_id')->get();
+        $exclude = $this->risk()->links()->excluder();
+        $shared = $this->sharedNets($nets);
+        $probes = [];
+        foreach ($rows as $row) {
+            if (isset($shared[$row->ip_net]) || $exclude((string)$row->ip, (string)$row->ip_net)) continue;
+            $probes[(string)$row->ip_net][(int)$row->user_id] = (int)$row->last_seen_at;
+        }
+        return $probes;
+    }
+
+    /**
+     * Which of these sources are shared: [ip_net => users] for SHARED_USERS or more users not isolated in the last
+     * SHARED_DAYS days (isolated users not counted: a honeypot node behind the same relay is no reason).
+     */
+    public function sharedNets(array $nets): array
+    {
+        if (!$nets) return [];
+        return RiskConn::whereIn('ip_net', $nets)->where('record_at', '>=', $this->access()->day(time()) - (self::SHARED_DAYS - 1) * 86400)
+            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->select('id'))
+            ->selectRaw('ip_net, COUNT(DISTINCT user_id) AS users')->groupBy('ip_net')
+            ->havingRaw('COUNT(DISTINCT user_id) >= ?', [self::SHARED_USERS])->pluck('users', 'ip_net')->all();
+    }
+
+    /**
+     * The probing IPs page by page, the latest first: the sources of the users isolated now, each with those users,
+     * the nodes, when, how many users not isolated connected from it in the last SHARED_DAYS days, and why it does
+     * not count, if so (node: a node IP; allow: allowlisted; shared). $ip: that source only. Returns [rows, total].
+     */
+    public function probes(int $page, int $size, ?string $ip = null): array
+    {
+        $isolated = User::where('risk_status', RiskService::STATUS_RISK)->select('id');
+        $query = RiskConn::whereIn('user_id', $isolated)->where('ip_net', '!=', '');
+        if ($ip !== null) $query->where('ip_net', $this->access()->ipNet($ip));
+        $total = (clone $query)->distinct()->count('ip_net');
+        $rows = (clone $query)->selectRaw('ip_net, MAX(ip) AS ip, MIN(first_seen_at) AS first_seen_at, MAX(last_seen_at) AS last_seen_at,'
+            . ' SUM(reports) AS reports')->groupBy('ip_net')->orderByDesc('last_seen_at')->forPage($page, $size)->get();
+        $nets = $rows->pluck('ip_net')->all();
+        $owners = $nets ? RiskConn::whereIn('ip_net', $nets)->whereIn('user_id', $isolated)->get(['ip_net', 'user_id', 'servers'])->groupBy('ip_net') : collect();
+        $others = $nets ? RiskConn::whereIn('ip_net', $nets)->where('record_at', '>=', $this->access()->day(time()) - (self::SHARED_DAYS - 1) * 86400)
+            ->whereNotIn('user_id', $isolated)->selectRaw('ip_net, COUNT(DISTINCT user_id) AS users')->groupBy('ip_net')->pluck('users', 'ip_net') : collect();
+        $isNode = $this->access()->nodeMatcher();
+        $allowed = [];
+        foreach (RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->get() as $entry) $allowed[] = $entry;
+        $data = $rows->map(function ($row) use ($owners, $others, $isNode, $allowed) {
+            $mine = $owners->get($row->ip_net, collect());
+            $users = (int)($others[$row->ip_net] ?? 0);
+            $allow = false;
+            foreach ($allowed as $entry) {
+                if ($this->risk()->entryMatches((string)$row->ip, $entry) || $this->risk()->ipRangeWithin((string)$row->ip_net, (string)$entry->value)) $allow = true;
+            }
+            $why = $isNode((string)$row->ip, (string)$row->ip_net) ? 'node' : ($allow ? 'allow' : ($users >= self::SHARED_USERS ? 'shared' : null));
+            return [
+                'ip_net' => (string)$row->ip_net, 'ip' => (string)$row->ip,
+                'users' => $mine->pluck('user_id')->unique()->values()->all(),
+                'nodes' => $mine->flatMap(function ($r) { return array_filter(explode(',', (string)$r->servers)); })->unique()->values()->all(),
+                'first_seen_at' => (int)$row->first_seen_at, 'last_seen_at' => (int)$row->last_seen_at, 'reports' => (int)$row->reports,
+                'others' => $users, 'excluded' => $why,
+            ];
+        })->all();
+        return [$data, $total];
+    }
+
+    /**
+     * Stop counting a source as a probing IP (删除测活 IP: as when the admin tested the honeypot nodes with an
+     * isolated user's subscription): delete its rows of the users isolated now. Returns those users' ids, for the
+     * audit log; null when it was not one.
+     */
+    public function dropProbe(string $ipNet): ?array
+    {
+        // The overflow row is no source
+        if ($ipNet === '') return null;
+        $isolated = User::where('risk_status', RiskService::STATUS_RISK)->select('id');
+        $users = RiskConn::where('ip_net', $ipNet)->whereIn('user_id', $isolated)->distinct()->pluck('user_id')->all();
+        if (!$users) return null;
+        RiskConn::where('ip_net', $ipNet)->whereIn('user_id', $users)->delete();
+        return array_map('intval', $users);
+    }
+
+    /**
+     * The user's sources today, for the bot's user card: [sources, segments], or null without any.
+     */
+    public function today(User $user): ?array
+    {
+        $nets = RiskConn::where('record_at', $this->access()->day(time()))->where('user_id', $user->id)->where('ip_net', '!=', '')->pluck('ip_net');
+        if (!$nets->count()) return null;
+        return [$nets->count(), $nets->map(function ($net) { return $this->segment((string)$net); })->unique()->count()];
+    }
+
+    /**
+     * The user's sources in the last 24 hours, the latest first: [up to $limit rows (one a source), all sources].
+     */
+    public function recent(User $user, int $limit): array
+    {
+        $since = time() - 86400;
+        $rows = RiskConn::whereIn('record_at', array_unique([$this->access()->day($since), $this->access()->day(time())]))
+            ->where('user_id', $user->id)->where('last_seen_at', '>=', $since)->orderByDesc('last_seen_at')->get()->unique('ip_net')->values();
+        return [$rows->take($limit)->values(), $rows->count()];
+    }
+
+    /**
+     * Who connected from these IPs (an IPv6 address by its /64, or a /64 given as such) in the last $days days, by IP
+     * as given: [ip => [user_id => ['connect' => reports, 'last_seen_at' => time]]].
+     */
+    public function usage(array $ips, int $days): array
+    {
+        $nets = [];
+        foreach (array_unique(array_filter($ips, 'strlen')) as $ip) $nets[$ip] = strpos($ip, '/') !== false ? $ip : $this->access()->ipNet($ip);
+        if (!$nets) return [];
+        $rows = RiskConn::whereIn('ip_net', array_values(array_unique($nets)))->where('record_at', '>=', $this->access()->day(time()) - ($days - 1) * 86400)
+            ->selectRaw('ip_net, user_id, SUM(reports) AS total, MAX(last_seen_at) AS last_seen_at')->groupBy('ip_net', 'user_id')->get();
+        $usage = [];
+        foreach ($nets as $ip => $net) {
+            foreach ($rows->where('ip_net', $net) as $row) {
+                $usage[$ip][(int)$row->user_id] = ['connect' => (int)$row->total, 'last_seen_at' => (int)$row->last_seen_at];
+            }
+        }
+        return $usage;
+    }
+
+    /**
+     * The users with the most sources on the day of $time (for the daily report): user_id, sources, segments and
+     * provinces (from where the IPs are, only counted), the most sources first. Not the users isolated now (their
+     * probing takes hundreds of sources a day) or admins: the list is for setting the thresholds.
+     */
+    public function top(int $time, int $limit = 5): array
+    {
+        $day = $this->access()->day($time);
+        $ids = RiskConn::where('record_at', $day)->where('ip_net', '!=', '')
+            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->orWhere('is_admin', 1)->select('id'))
+            ->selectRaw('user_id, COUNT(*) AS total')->groupBy('user_id')->orderByDesc('total')->limit($limit)->pluck('user_id')->all();
+        if (!$ids) return [];
+        $rows = RiskConn::where('record_at', $day)->whereIn('user_id', $ids)->get()->groupBy('user_id');
+        $info = (new IpInfoService())->lookupMany($rows->flatten(1)->pluck('ip')->unique()->values()->all());
+        $top = [];
+        foreach ($ids as $id) {
+            $summary = $this->summarize($rows->get($id, collect()), $info);
+            $top[] = ['user_id' => (int)$id, 'sources' => $summary['sources'], 'segments' => $summary['segments'], 'provinces' => $summary['provinces']];
+        }
+        return $top;
+    }
+
+    /**
+     * Where an IP is in a few words for the alerts (广东 联通): its location without 中国, and its ISP.
+     */
+    private function where(?array $info): string
+    {
+        if (!$info) return '';
+        return trim(preg_replace('/^中国\s*/u', '', (string)($info['location'] ?? '')) . ' ' . ($info['network'] ?? ''));
     }
 
     /**

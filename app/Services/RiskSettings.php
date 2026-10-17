@@ -39,6 +39,10 @@ class RiskSettings
         // for good
         'conn_log_enabled' => true,
         'conn_log_days' => 30,
+        // 连接 IP 过多: a user's sources in an hour that alert; 0: not checked
+        'conn_ip_limit' => 10,
+        // 命中测活 IP: the probing IPs (isolated users' sources) a user connected from today that alert; 0: not checked
+        'conn_link_ips' => 1,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;

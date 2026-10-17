@@ -188,14 +188,16 @@ class RiskBot
             case 'NA': return $this->addAutoNodes($context, $operator);
         }
         if (in_array($verb, ['p', 'P', 'k', 'w', 'W', 'g', 'G'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $operator);
-        if (!in_array($verb, ['c', 'cr', 'ue', 'i', 'r', 'I', 'R', 'x', 's', 'S', 't', 'T'], true)) return '';
+        if (!in_array($verb, ['c', 'cr', 'ue', 'cnr', 'i', 'r', 'I', 'R', 'x', 's', 'S', 't', 'T'], true)) return '';
 
-        $card = in_array($verb, ['c', 'cr', 'ue'], true);
+        $card = in_array($verb, ['c', 'cr', 'ue', 'cnr'], true);
         $user = User::find($card ? $int(2) : $int(3));
         if (!$user) return '用户不存在';
         if ($verb === 'c') $this->edit($context, $this->view->userCard($user));
         if ($verb === 'cr') $this->send($context->chat_id, $this->view->userCard($user), $context->message_id);
         if ($verb === 'ue') $this->edit($context, $this->view->userEvents($user, (string)($parts[3] ?? 's'), $int(4)));
+        // 连接记录 from an alert: sent as a reply, the alert stays
+        if ($verb === 'cnr') $this->send($context->chat_id, $this->view->userConns($user, true), $context->message_id);
         if ($card) return '';
         return $this->userAction($verb, (string)($parts[2] ?? ''), $user, RiskEvent::find($int(4)), $context, $operator);
     }
@@ -207,7 +209,7 @@ class RiskBot
     {
         if (!filter_var($ip, FILTER_VALIDATE_IP)) return 'IP 无效';
         $risk = new RiskService();
-        $usage = $risk->ipUsage([$ip], $risk->searchDays())[$ip] ?? [];
+        $usage = $risk->searchUsage($ip);
         $this->send($context->chat_id, $this->view->searchResults($risk->findUsers($ip, 20), $ip, $usage), $context->message_id);
         return '';
     }
