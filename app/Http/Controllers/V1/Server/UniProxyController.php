@@ -4,6 +4,7 @@ namespace App\Http\Controllers\V1\Server;
 
 use App\Http\Controllers\Controller;
 use App\Services\RiskAccessService;
+use App\Services\RiskConnService;
 use App\Services\ServerService;
 use App\Services\UserService;
 use App\Services\V2nodeLegacyService;
@@ -153,7 +154,9 @@ class UniProxyController extends Controller
             ], 400);
         }
         $updateAt = time();
-        // fork: the node IPs (a relay's address, seen by a node behind it) are not the users' devices
+        // fork: the connection log keeps the report as it came; the node IPs (a relay's address, seen by a node behind
+        // it) are not the users' devices
+        (new RiskConnService())->buffer($this->nodeType . $this->nodeInfo->id, $updateAt, $data);
         $data = (new RiskAccessService())->withoutNodeIps($data);
 
         $cacheKeys = [];

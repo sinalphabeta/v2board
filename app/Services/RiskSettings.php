@@ -35,6 +35,10 @@ class RiskSettings
         'daily_report' => true,
         // Alerts of each kind a day (RiskAlertService); the rest are only in the risk events and the daily report
         'alert_daily_limit' => 20,
+        // The connection log (RiskConnService): the IPs users connect to the nodes from; an isolated user's are kept
+        // for good
+        'conn_log_enabled' => true,
+        'conn_log_days' => 30,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;

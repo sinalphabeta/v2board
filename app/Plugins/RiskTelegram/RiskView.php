@@ -44,6 +44,7 @@ class RiskView
         'access_log_enabled' => '访问记录', 'access_log_days' => '访问记录保留天数', 'sub_daily_limit' => '每天订阅上限',
         'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
         'alert_daily_limit' => '每类告警每天上限', 'sub_burst_limit' => '10 分钟订阅次数告警',
+        'conn_log_enabled' => '连接记录', 'conn_log_days' => '连接记录保留天数',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];

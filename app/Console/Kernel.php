@@ -44,6 +44,7 @@ class Kernel extends ConsoleKernel
         $schedule->command('risk:scan')->everyTenMinutes()->withoutOverlapping();
         // A lookup may hang for a while: its lock expires after 5 minutes, not a day, if the run is killed
         $schedule->command('risk:node-resolve')->everyMinute()->withoutOverlapping(5);
+        $schedule->command('risk:conn-flush')->everyMinute()->withoutOverlapping(5);
         $schedule->command('risk:geoip-update')->dailyAt('03:30')->withoutOverlapping();
         // send
         $schedule->command('send:remindMail')->dailyAt('11:30');

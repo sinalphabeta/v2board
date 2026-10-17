@@ -7,6 +7,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Plan;
 use App\Models\RiskAccess;
 use App\Models\RiskAudit;
+use App\Models\RiskConn;
 use App\Models\RiskEvent;
 use App\Models\RiskIndicator;
 use App\Models\ServerGroup;
@@ -14,6 +15,7 @@ use App\Models\User;
 use App\Plugins\RiskTelegram\RiskOperator;
 use App\Services\IpInfoService;
 use App\Services\RiskAccessService;
+use App\Services\RiskConnService;
 use App\Services\RiskService;
 use App\Services\RiskSettings;
 use Illuminate\Http\Request;
@@ -120,11 +122,12 @@ class RiskController extends Controller
             if ($invalid) abort(500, '可信代理里这些不是 IP 或 CIDR：' . implode('、', $invalid));
             $values['trusted_proxies'] = implode(',', array_unique($proxies));
         }
-        foreach (['access_log_enabled', 'link_detection', 'daily_report'] as $name) {
+        foreach (['access_log_enabled', 'link_detection', 'daily_report', 'conn_log_enabled'] as $name) {
             if (!$request->has($name)) continue;
             $enabled = (string)$request->input($name);
-            if (!in_array($enabled, ['0', '1'], true)) abort(500, '参数错误');
-            $values[$name] = $enabled === '1';
+            // An admin panel older than a switch sends the value it fetched, form-encoded: true / false
+            if (!in_array($enabled, ['0', '1', 'true', 'false'], true)) abort(500, '参数错误');
+            $values[$name] = $enabled === '1' || $enabled === 'true';
         }
         $ranges = [
             'access_log_days' => [7, 365, '访问记录保留天数应该是 7 到 365 之间的整数'],
@@ -132,6 +135,7 @@ class RiskController extends Controller
             'link_ip_users' => [2, 50, '同 IP 多用户阈值应该是 2 到 50 之间的整数'],
             'alert_daily_limit' => [5, 500, '每类告警每天上限应该是 5 到 500 之间的整数'],
             'sub_burst_limit' => [0, 500, '10 分钟订阅次数告警应该是 0（不检测）或 5 到 500 之间的整数'],
+            'conn_log_days' => [7, 365, '连接记录保留天数应该是 7 到 365 之间的整数'],
         ];
         foreach ($ranges as $name => [$min, $max, $error]) {
             if (!$request->has($name)) continue;
@@ -455,6 +459,175 @@ class RiskController extends Controller
                 ] + $this->ipInfoFields($info[$row->ip] ?? null);
             })->values();
         }, 100);
+    }
+
+    /**
+     * The users and sources online (reported in the last 3 minutes, or with window=3600 the last hour) by province,
+     * the connection log's state, and the panel's 节点用户设备数统计最低阈值: above 0, the nodes leave out the users
+     * with less traffic in a report, as a probe has.
+     */
+    public function connLive(Request $request)
+    {
+        $window = (int)$request->input('window') === 3600 ? 3600 : RiskConnService::ONLINE_SECONDS;
+        $conn = new RiskConnService();
+        return response(['data' => $conn->live($window) + [
+            'stats' => $conn->stats(),
+            'device_min_traffic' => (int)config('v2board.server_device_online_min_traffic', 0),
+        ]]);
+    }
+
+    /**
+     * The connection log by user, the most sources first: each user's sources in a date range (see connRange()), with
+     * how spread they are (RiskConnService::summarize()) and the nodes. The other filters (a user, an IP, see
+     * connFilter()) pick the users, whose sources all count.
+     */
+    public function connUsers(Request $request)
+    {
+        $conn = new RiskConnService();
+        $picked = RiskConn::query();
+        [$from, $to, $narrowed] = $this->connRange($request, $picked);
+        $filtered = $this->connFilter($request, $picked, $conn);
+        $query = RiskConn::where('record_at', '>=', $from)->where('record_at', '<=', $to)->where('ip_net', '!=', '');
+        if ($narrowed || $filtered) $query->whereIn('user_id', $picked->where('ip_net', '!=', '')->select('user_id'));
+        $total = (clone $query)->distinct()->count('user_id');
+        $current = max(1, (int)$request->input('current', 1));
+        $pageSize = min(100, max(10, (int)$request->input('pageSize', 10)));
+        $page = (clone $query)->selectRaw('user_id, COUNT(DISTINCT ip_net) AS sources, SUM(reports) AS reports, MAX(last_seen_at) AS last_seen_at')
+            ->groupBy('user_id')->orderByDesc('sources')->orderByDesc('last_seen_at')->forPage($current, $pageSize)->get();
+        $ids = $page->pluck('user_id')->all();
+        $rows = RiskConn::where('record_at', '>=', $from)->where('record_at', '<=', $to)->whereIn('user_id', $ids)
+            ->get(['user_id', 'ip_net', 'ip', 'servers', 'first_seen_at', 'last_seen_at'])->groupBy('user_id');
+        $info = (new IpInfoService())->lookupMany($rows->flatten(1)->pluck('ip')->unique()->values()->all());
+        $users = User::whereIn('id', $ids)->get(['id', 'email', 'risk_status'])->keyBy('id');
+        $summaries = [];
+        foreach ($rows as $userId => $userRows) $summaries[$userId] = $conn->summarize($userRows, $info);
+        $servers = $conn->servers(array_merge([], ...array_column($summaries, 'nodes')));
+        return response(['data' => $page->map(function ($row) use ($users, $summaries, $servers) {
+            $user = $users->get($row->user_id);
+            $summary = $summaries[$row->user_id] ?? [];
+            return [
+                'user_id' => (int)$row->user_id,
+                'email' => $user ? $user->email : null,
+                'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
+                'reports' => (int)$row->reports,
+                'servers' => array_values(array_intersect_key($servers, array_flip($summary['nodes'] ?? []))),
+            ] + array_diff_key($summary, ['nodes' => 1]);
+        })->values(), 'total' => $total]);
+    }
+
+    /**
+     * The connection log, the latest first, like accessFetch(): a date range (see connRange()) and the other filters
+     * (see connFilter()). Each row says whether a list covers its source now. Pages of at most 100 rows.
+     */
+    public function connFetch(Request $request)
+    {
+        $conn = new RiskConnService();
+        $query = RiskConn::query();
+        $this->connRange($request, $query);
+        $this->connFilter($request, $query, $conn);
+        $query->orderByDesc('record_at')->orderByDesc('last_seen_at');
+        return $this->paged($request, $query, function ($rows) use ($conn) {
+            $users = User::whereIn('id', $rows->pluck('user_id')->unique()->values())->get(['id', 'email', 'risk_status'])->keyBy('id');
+            $info = (new IpInfoService())->lookupMany($rows->pluck('ip')->unique()->values()->all());
+            $isNode = (new RiskAccessService())->nodeMatcher();
+            $servers = $conn->servers($rows->flatMap(function (RiskConn $row) { return array_filter(explode(',', (string)$row->servers)); })->all());
+            $service = new RiskService();
+            $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->get();
+            $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
+            return $rows->map(function (RiskConn $row) use ($users, $info, $isNode, $servers, $service, $allowlist, $ipRules) {
+                $user = $users->get($row->user_id);
+                $source = $row->ip_net !== '';
+                return [
+                    // The primary key, for the table's row key
+                    'key' => implode('|', [$row->record_at, $row->user_id, $row->ip_net]),
+                    'record_at' => $row->record_at,
+                    'user_id' => $row->user_id,
+                    'email' => $user ? $user->email : null,
+                    'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
+                    'ip' => $row->ip,
+                    'ip_net' => $row->ip_net,
+                    // A node IP (a relay's address): only kept for isolated users
+                    'ip_node' => $source && $isNode((string)$row->ip, (string)$row->ip_net),
+                    // Whether an enabled allowlist entry (IP 白名单 or 节点 IP) covers the source now
+                    'ip_allowed' => $source && $allowlist->contains(function (RiskIndicator $entry) use ($service, $row) {
+                        return $service->entryMatches((string)$row->ip, $entry);
+                    }),
+                    // The enabled IP indicator covering the whole source now (the same IP or a range): it is listed already
+                    'ip_listed' => $source ? $ipRules->first(function ($rule) use ($service, $row) {
+                        return $service->ipRangeWithin((string)$row->ip_net, trim((string)$rule));
+                    }) : null,
+                    // The row that takes a user's sources over the daily limit
+                    'overflow' => !$source,
+                    'servers' => array_values(array_intersect_key($servers, array_flip(array_filter(explode(',', (string)$row->servers))))),
+                    'reports' => $row->reports,
+                    'first_seen_at' => $row->first_seen_at,
+                    'last_seen_at' => $row->last_seen_at,
+                ] + $this->ipInfoFields($info[$row->ip] ?? null);
+            })->values();
+        }, 100);
+    }
+
+    /**
+     * Narrow a connection log query by date (date_from / date_to as Y-m-d, both default today), user (user_id,
+     * keyword) and IP (an IPv6 address matches its /64): at most 31 days, or a year with a user or an IP (an isolated
+     * user's rows are kept for good). Returns [from, to, narrowed]: the days' 0:00, and whether a user or an IP was given.
+     */
+    private function connRange(Request $request, $query): array
+    {
+        $access = new RiskAccessService();
+        $today = $access->day(time());
+        $from = $this->date($request->input('date_from')) ?? $today;
+        $to = $this->date($request->input('date_to')) ?? $today;
+        if ($from > $to) [$from, $to] = [$to, $from];
+        $query->where('record_at', '>=', $from)->where('record_at', '<=', $to);
+        $narrowed = false;
+        if ($request->input('user_id')) {
+            $query->where('user_id', (int)$request->input('user_id'));
+            $narrowed = true;
+        }
+        $keyword = $this->keyword($request);
+        if ($keyword !== null) {
+            $query->whereIn('user_id', User::where('email', 'like', $keyword)->select('id'));
+            $narrowed = true;
+        }
+        $ip = trim((string)$request->input('ip', ''));
+        if ($ip !== '') {
+            if (!filter_var($ip, FILTER_VALIDATE_IP)) abort(500, 'IP 格式有误');
+            $query->where('ip_net', $access->ipNet($ip));
+            $narrowed = true;
+        }
+        $maxDays = $narrowed ? 366 : 31;
+        if (($to - $from) / 86400 + 1 > $maxDays) abort(500, $narrowed ? "日期范围最多 {$maxDays} 天" : '没有选用户或 IP 时，日期范围最多 31 天');
+        return [$from, $to, $narrowed];
+    }
+
+    /**
+     * The connection log's other filters: a node (server, as v2node3), online (reported in the last 3 minutes, or
+     * the last hour with online=3600) and a place (place: a province, 海外 or 未知, see RiskConnService::placeName();
+     * looked up from the IPs, so at most RiskConnService::PLACE_LOOKUPS sources). Returns whether any was given.
+     */
+    private function connFilter(Request $request, $query, RiskConnService $conn): bool
+    {
+        $filtered = false;
+        $server = $request->input('server');
+        if (is_string($server) && $server !== '') {
+            if (!preg_match('/^[a-z][a-z0-9]*?\d+$/', $server)) abort(500, '节点有误');
+            $query->whereRaw('FIND_IN_SET(?, `servers`)', [$server]);
+            $filtered = true;
+        }
+        $online = (int)$request->input('online');
+        if ($online) {
+            $query->where('last_seen_at', '>=', time() - ($online === 3600 ? 3600 : RiskConnService::ONLINE_SECONDS));
+            $filtered = true;
+        }
+        $place = $request->input('place');
+        if (is_string($place) && trim($place) !== '') {
+            $nets = $conn->netsIn($query, trim($place));
+            if ($nets === null) abort(500, '按地区筛选时 IP 太多（超过 ' . RiskConnService::PLACE_LOOKUPS . ' 个），请缩小日期范围或只看在线');
+            $query->whereIn('ip_net', $nets);
+            $filtered = true;
+        }
+        return $filtered;
     }
 
     /**

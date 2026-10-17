@@ -958,3 +958,17 @@ ALTER TABLE `v2_risk_event`
 
 ALTER TABLE `v2_risk_audit`
   MODIFY `actor_id` bigint(20) DEFAULT NULL;
+
+CREATE TABLE IF NOT EXISTS `v2_risk_conn` (
+  `record_at` int(11) NOT NULL,
+  `user_id` int(11) NOT NULL,
+  `ip_net` varchar(45) NOT NULL,
+  `ip` varchar(45) NOT NULL,
+  `servers` varchar(255) NOT NULL DEFAULT '',
+  `reports` int(10) unsigned NOT NULL DEFAULT '1',
+  `first_seen_at` int(11) NOT NULL,
+  `last_seen_at` int(11) NOT NULL,
+  PRIMARY KEY (`record_at`,`user_id`,`ip_net`),
+  KEY `risk_conn_user` (`user_id`,`record_at`),
+  KEY `risk_conn_net` (`ip_net`,`record_at`,`user_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
