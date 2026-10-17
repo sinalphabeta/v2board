@@ -185,6 +185,10 @@ class RiskLinkService
                 ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'skipped_alerts' => $this->risk->skippedAlerts($from),
             'merged_alerts' => $this->risk->alerts()->dayCounts($from)['merged'],
+            // Findings about quiet users (免告警) recorded but not alerted, and how many users are quiet now: the lists of
+            // many places and sources leave them out
+            'quiet_alerts' => $this->risk->alerts()->dayCounts($from)['quiet'],
+            'quiet_users' => RiskIndicator::where('type', 'quiet')->where('enabled', 1)->count(),
             'top_subscribers' => $top->map(function ($row) use ($email) {
                 return ['user_id' => (int)$row->user_id, 'email' => $email($row->user_id), 'total' => (int)$row->total,
                     'ips' => (int)$row->ips, 'clients' => (int)$row->clients];
@@ -260,13 +264,15 @@ class RiskLinkService
 
     /**
      * Users who subscribed from REPORT_REGIONS or more places (country and province, from the IP's location) in the
-     * day, left-out IPs aside, with their ASNs too: up to 5, the most places first. The location is only counted here,
-     * never matched against.
+     * day, left-out IPs aside, with their ASNs too: up to 5, the most places first. Not quiet users (sharing a plan with
+     * friends in other places). The location is only counted here, never matched against.
      */
     private function regions(int $day): array
     {
-        $rows = RiskAccess::where('record_at', $day)->where('event_type', RiskAccessService::TYPES['subscription'])
-            ->where('ip_net', '!=', '')->get(['user_id', 'ip', 'ip_net']);
+        $query = RiskAccess::where('record_at', $day)->where('event_type', RiskAccessService::TYPES['subscription'])->where('ip_net', '!=', '');
+        $quiet = $this->risk->quietUserIds();
+        if ($quiet) $query->whereNotIn('user_id', $quiet);
+        $rows = $query->get(['user_id', 'ip', 'ip_net']);
         $exclude = $this->excluder();
         $rows = $rows->reject(function (RiskAccess $row) use ($exclude) { return $exclude((string)$row->ip, (string)$row->ip_net); });
         // Only users with several IPs can have several places

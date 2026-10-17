@@ -37,12 +37,21 @@ class RiskService
         'conn_ips' => '连接 IP 过多', 'conn_link' => '命中测活 IP',
     ];
     /**
-     * Indicator types. allow_ip and node_ip are allowlists (ALLOW_TYPES). The others are risk rules (RULE_TYPES): a
-     * match is recorded and alerted, and an email match also isolates the user.
+     * The findings that are recorded but not alerted for a quiet user (免告警, e.g. one sharing a plan with friends):
+     * many sources, many subscriptions. 命中测活 IP still alerts: someone they share the plan with may be the probe.
      */
-    public const TYPES = ['email' => '邮箱', 'ip' => 'IP', 'ua' => 'UA', 'asn' => 'ASN', 'allow_ip' => 'IP 白名单', 'node_ip' => '节点 IP'];
+    public const QUIET_TYPES = ['sub_limit', 'sub_burst', 'conn_ips'];
+    /**
+     * Indicator types. allow_ip and node_ip are allowlists (ALLOW_TYPES). email, ip, ua and asn are risk rules
+     * (RULE_TYPES): a match is recorded and alerted, and an email match also isolates the user. quiet holds the emails
+     * of the users not alerted about for QUIET_TYPES: neither a rule nor an allowlist.
+     */
+    public const TYPES = [
+        'email' => '邮箱', 'ip' => 'IP', 'ua' => 'UA', 'asn' => 'ASN', 'allow_ip' => 'IP 白名单', 'node_ip' => '节点 IP', 'quiet' => '免告警',
+    ];
     public const LIST_NAMES = [
         'email' => '邮箱名单', 'ip' => 'IP 名单', 'ua' => 'UA 名单', 'asn' => 'ASN 名单', 'allow_ip' => 'IP 白名单', 'node_ip' => '节点 IP',
+        'quiet' => '免告警用户',
     ];
     public const RULE_TYPES = ['email', 'ip', 'ua', 'asn'];
     /**
@@ -56,6 +65,7 @@ class RiskService
     public const ALLOW_IP_FORMAT = 'IP 白名单只接受 IP，或不大于 /16（IPv6 /48）的网段，也不能是 0.0.0.0 或 ::';
     // A node IP may also be a relay's domain name (DDNS), see RiskAccessService::resolveNodeHosts()
     public const NODE_IP_FORMAT = '节点 IP 只接受 IP、不大于 /16（IPv6 /48）的网段或域名，也不能是 0.0.0.0 或 ::';
+    public const QUIET_FORMAT = '免告警只接受邮箱或用户的 uid（uid 要能找到用户）';
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
     private $ipInfoService;
     private $access;
@@ -119,10 +129,11 @@ class RiskService
     public function normalizeIndicatorValue(string $type, $value): ?string
     {
         $value = trim((string)$value);
-        if ($type === 'email') $value = $this->normalizeEmail($value);
+        $email = $type === 'email' || $type === 'quiet';
+        if ($email) $value = $this->normalizeEmail($value);
         if ($type === 'asn') $value = (string)$this->normalizeAsn($value);
         if ($value === '' || mb_strlen($value, 'UTF-8') > 255) return null;
-        if ($type === 'email') return filter_var($value, FILTER_VALIDATE_EMAIL) ? $value : null;
+        if ($email) return filter_var($value, FILTER_VALIDATE_EMAIL) ? $value : null;
         if ($type === 'ip' || in_array($type, self::ALLOW_TYPES, true)) {
             $range = $this->normalizeIpRange($value, $type !== 'ip');
             if ($range === null && $type === 'node_ip') return $this->normalizeHost($value);
@@ -132,11 +143,24 @@ class RiskService
     }
 
     /**
-     * Why a value was refused for an allowlist (IP 白名单, 节点 IP), or null for the other types.
+     * A value for an indicator of this type as typed on the admin panel or to the bot, before normalizeIndicatorValue():
+     * a quiet user (免告警) may be given by uid, which stands for the user's email (null when there is no such user).
+     */
+    public function indicatorInput(string $type, $value): ?string
+    {
+        $value = trim((string)$value);
+        if ($type !== 'quiet' || !ctype_digit($value)) return $value;
+        $user = User::find((int)$value);
+        return $user ? (string)$user->email : null;
+    }
+
+    /**
+     * Why a value was refused for an allowlist (IP 白名单, 节点 IP) or the quiet users, or null for the other types.
      */
     public static function formatHint(string $type): ?string
     {
         if ($type === 'node_ip') return self::NODE_IP_FORMAT;
+        if ($type === 'quiet') return self::QUIET_FORMAT;
         return $type === 'allow_ip' ? self::ALLOW_IP_FORMAT : null;
     }
 
@@ -403,15 +427,85 @@ class RiskService
         return $query->get();
     }
 
-    public function matches(string $email, string $ip, string $ua): array
+    /**
+     * The enabled indicators, cached for a minute (cleared when one is saved), or null when the cache is down.
+     */
+    private function enabledIndicators()
     {
         try {
-            $indicators = Cache::remember(self::INDICATORS_CACHE_KEY, 60, function () {
+            return Cache::remember(self::INDICATORS_CACHE_KEY, 60, function () {
                 return RiskIndicator::where('enabled', 1)->get();
             });
         } catch (\Throwable $e) {
-            return [];
+            return null;
         }
+    }
+
+    /**
+     * Whether the user is quiet (免告警: their email in an enabled quiet indicator), from the indicator cache: their
+     * QUIET_TYPES findings are recorded, not alerted. False when the cache is down, so that they alert.
+     */
+    public function isQuiet(User $user): bool
+    {
+        $indicators = $this->enabledIndicators();
+        if ($indicators === null) return false;
+        $email = $this->normalizeEmail($user->email);
+        foreach ($indicators as $indicator) {
+            if ($indicator->type === 'quiet' && $this->normalizeEmail($indicator->value) === $email) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The enabled quiet indicator of the user, from the database (for its note), or null.
+     */
+    public function quietEntry(User $user): ?RiskIndicator
+    {
+        return $this->quietEntries($user)->first();
+    }
+
+    private function quietEntries(User $user)
+    {
+        return RiskIndicator::where('type', 'quiet')->where('enabled', 1)
+            ->whereRaw('LOWER(TRIM(value)) = ?', [$this->normalizeEmail($user->email)])->orderBy('id')->get();
+    }
+
+    /**
+     * The ids of the quiet users now, from the database: the admin pages mark and filter them, the daily report leaves
+     * them out of the lists of many places and sources.
+     */
+    public function quietUserIds(): array
+    {
+        $emails = RiskIndicator::where('type', 'quiet')->where('enabled', 1)->pluck('value')
+            ->map(function ($email) { return $this->normalizeEmail($email); })->unique()->values()->all();
+        if (!$emails) return [];
+        return User::whereRaw('LOWER(TRIM(email)) IN (' . implode(', ', array_fill(0, count($emails), '?')) . ')', $emails)
+            ->pluck('id')->map(function ($id) { return (int)$id; })->all();
+    }
+
+    /**
+     * Make a user quiet (免告警) by adding their email to the quiet indicators; an existing indicator keeps its note.
+     */
+    public function quietUser(User $user, ?string $note = null): RiskIndicator
+    {
+        $existing = RiskIndicator::where('type', 'quiet')->where('value', $this->normalizeEmail($user->email))->first();
+        return $this->addIndicator('quiet', (string)$user->email, $note ?? ($existing ? $existing->note : null));
+    }
+
+    /**
+     * Alert about a user again (恢复告警): disable the quiet indicators of their email. Returns whether they are no
+     * longer quiet.
+     */
+    public function unquietUser(User $user): bool
+    {
+        foreach ($this->quietEntries($user) as $entry) $this->removeIndicator($entry);
+        return $this->quietEntry($user) === null;
+    }
+
+    public function matches(string $email, string $ip, string $ua): array
+    {
+        $indicators = $this->enabledIndicators();
+        if ($indicators === null) return [];
         $email = $this->normalizeEmail($email);
         $ua = strtolower($ua);
         // An allowlisted IP skips the IP and ASN rules, so its ASN is not looked up either
@@ -544,10 +638,15 @@ class RiskService
     /**
      * Record what a check found about a user as a risk event of a FINDING_TYPES type, with $detail as the evidence, and
      * alert it (see notify()). $key identifies the finding: recording it again updates the same event (and alerts again
-     * unless $alert is false). 注册关联 alerts are merged by the registration IP (an IPv6 /64).
+     * unless $alert is false). 注册关联 alerts are merged by the registration IP (an IPv6 /64). A quiet user's QUIET_TYPES
+     * findings are only recorded: not alerted, and not counted in the daily budget of alerts.
      */
     public function recordFinding(User $user, string $type, string $ip, string $ua, string $detail, string $key, bool $alert = true): ?RiskEvent
     {
+        if ($alert && in_array($type, self::QUIET_TYPES, true) && $this->isQuiet($user)) {
+            $alert = false;
+            $this->alerts()->quieted();
+        }
         $ua = $this->cleanUserAgent($ua, 512);
         $detail = mb_substr($detail, 0, 255, 'UTF-8');
         $now = time();
@@ -731,13 +830,14 @@ class RiskService
      * Add indicators of a type, as the admin panel and the risk bot do. Returns the values grouped as added, existing
      * (already enabled), invalid, allowlisted (IP indicators an allowlist entry covers, not added) and disabled (IP
      * indicators that the added allowlist entries cover). A disabled indicator added again keeps its note unless
-     * $note is given.
+     * $note is given. A quiet user may be given by uid (indicatorInput()): an unknown uid is invalid.
      */
     public function addIndicators(string $type, array $values, ?string $note = null): array
     {
         $result = ['added' => [], 'existing' => [], 'invalid' => [], 'allowlisted' => [], 'disabled' => []];
         foreach ($values as $rawValue) {
-            $value = $this->normalizeIndicatorValue($type, $rawValue);
+            $input = $this->indicatorInput($type, $rawValue);
+            $value = $input === null ? null : $this->normalizeIndicatorValue($type, $input);
             if ($value === null) {
                 $result['invalid'][] = trim((string)$rawValue);
                 continue;

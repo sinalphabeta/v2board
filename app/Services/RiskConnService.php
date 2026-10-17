@@ -407,14 +407,16 @@ class RiskConnService
             })->implode('、');
             $detail = "1 小时内 {$summary['sources']} 个 IP（{$summary['segments']} 个网段，{$summary['brief']} 个只出现了一两分钟）· "
                 . "{$summary['provinces']} 个地区、{$networks} 个运营商 · 节点 " . (implode('、', array_slice($names, 0, 3)) ?: '-') . " · {$examples}";
-            if ($this->recordOnce($users->get($userId), 'conn_ips', (string)$latest->first()->ip, $detail)) $alerted++;
+            $user = $users->get($userId);
+            if ($this->recordOnce($user, 'conn_ips', (string)$latest->first()->ip, $detail, $this->risk()->isQuiet($user))) $alerted++;
         }
         return $alerted;
     }
 
     /**
      * 命中测活 IP: a user (not isolated, not an admin) connecting today from conn_link_ips or more probing IPs (see
-     * probeUsers()); under the link checks' switch.
+     * probeUsers()); under the link checks' switch. It alerts for quiet users too: someone they share the plan with may
+     * be the probe.
      */
     private function scanProbes(): int
     {
@@ -441,23 +443,35 @@ class RiskConnService
                 return $row->ip_net . (strpos($row->ip_net, ':') !== false ? '（IPv6 /64）' : '（IPv4）') .
                     " 被已隔离用户 uid {$owner} 用过，最后 " . date('m-d', $by[$owner]);
             })->implode('；');
-            if ($this->recordOnce($users->get($userId), 'conn_link', (string)$hits->first()->ip, $detail)) $alerted++;
+            if ($this->recordOnce($users->get($userId), 'conn_link', (string)$hits->first()->ip, $detail, false)) $alerted++;
         }
         return $alerted;
     }
 
     /**
      * Record a finding about the user, alerted once in 24 hours (not by the date: a check before and after midnight
-     * would alert twice); later scans update the same event quietly. Returns whether it alerted.
+     * would alert twice); later scans update the same event, without alerting. A quiet user's ($quiet) is recorded
+     * silent: it alerts once a later scan finds them no longer quiet, within the same 24 hours. Returns whether it
+     * alerted.
      */
-    private function recordOnce(User $user, string $type, string $ip, string $detail): bool
+    private function recordOnce(User $user, string $type, string $ip, string $detail, bool $quiet): bool
     {
         $key = "risk:conn:{$type}:" . (int)$user->id;
-        // Which alert the later scans update: its time and a random part, as two may come within a second
-        $alerted = time() . ':' . bin2hex(random_bytes(4));
-        $alert = Cache::add($key, $alerted, 86400);
-        if (!$alert) $alerted = (string)Cache::get($key, $alerted);
-        $this->risk()->recordFinding($user, $type, $ip, '', $detail, "{$type}|{$user->id}|{$alerted}", $alert);
+        $now = time();
+        // Which event the later scans update: its time and a random part, as two may come within a second; ':q' after
+        // them while it is silent
+        $id = $now . ':' . bin2hex(random_bytes(4));
+        if (Cache::add($key, $id . ($quiet ? ':q' : ''), 86400)) {
+            if ($quiet) $this->risk()->alerts()->quieted();
+            $alert = !$quiet;
+        } else {
+            $stored = explode(':', (string)Cache::get($key, $id));
+            $id = ($stored[0] ?? $now) . ':' . ($stored[1] ?? '');
+            // Silent so far, and not quiet any more: alerted now, for the rest of the 24 hours
+            $alert = ($stored[2] ?? '') === 'q' && !$quiet;
+            if ($alert) Cache::put($key, $id, max(1, (int)$stored[0] + 86400 - $now));
+        }
+        $this->risk()->recordFinding($user, $type, $ip, '', $detail, "{$type}|{$user->id}|{$id}", $alert);
         return $alert;
     }
 
@@ -592,14 +606,17 @@ class RiskConnService
     /**
      * The users with the most sources on the day of $time (for the daily report): user_id, sources, segments and
      * provinces (from where the IPs are, only counted), the most sources first. Not the users isolated now (their
-     * probing takes hundreds of sources a day) or admins: the list is for setting the thresholds.
+     * probing takes hundreds of sources a day), admins or quiet users (sharing a plan takes many too): the list is for
+     * setting the thresholds.
      */
     public function top(int $time, int $limit = 5): array
     {
         $day = $this->access()->day($time);
-        $ids = RiskConn::where('record_at', $day)->where('ip_net', '!=', '')
-            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->orWhere('is_admin', 1)->select('id'))
-            ->selectRaw('user_id, COUNT(*) AS total')->groupBy('user_id')->orderByDesc('total')->limit($limit)->pluck('user_id')->all();
+        $query = RiskConn::where('record_at', $day)->where('ip_net', '!=', '')
+            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->orWhere('is_admin', 1)->select('id'));
+        $quiet = $this->risk()->quietUserIds();
+        if ($quiet) $query->whereNotIn('user_id', $quiet);
+        $ids = $query->selectRaw('user_id, COUNT(*) AS total')->groupBy('user_id')->orderByDesc('total')->limit($limit)->pluck('user_id')->all();
         if (!$ids) return [];
         $rows = RiskConn::where('record_at', $day)->whereIn('user_id', $ids)->get()->groupBy('user_id');
         $info = (new IpInfoService())->lookupMany($rows->flatten(1)->pluck('ip')->unique()->values()->all());

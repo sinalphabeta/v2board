@@ -42,7 +42,9 @@ The admin mostly runs it from the Telegram risk bot on a phone; the admin panel'
 through `RiskService`. Read the code before changing it:
 
 - `app/Services/RiskService.php`: indicator types (`TYPES`; `allow_ip`, the IP allowlist, and `node_ip`, the nodes'
-  exit IPs, are the allowlists in `ALLOW_TYPES`, the others are rules), matching and events (`observe()` from login,
+  exit IPs, are the allowlists in `ALLOW_TYPES`; `quiet` lists the quiet users (免告警, by email; a uid typed on the
+  panel or to the bot stands for that user's email, `indicatorInput()`), whose `QUIET_TYPES` findings
+  `recordFinding()` records without alerting; the others are rules), matching and events (`observe()` from login,
   register and subscription), alerts (`SendRiskTelegramJob`), isolation (an email indicator), adding and changing
   indicators (`addIndicators()`; `saveIndicatorChecked()` keeps the IP list and the allowlists apart), disabling them
   (`removeIndicator()`, 停用, audited as `delete`: the switch and the bot's /del…) and deleting them
@@ -62,11 +64,14 @@ through `RiskService`. Read the code before changing it:
   appends the report to a Redis list; `risk:conn-flush` writes it every minute in one upsert, and keeps a batch that fails.
   Rows are kept `conn_log_days`, and for good for the users isolated now: their sources are the probing IPs. `risk:scan` runs
   its two checks: `conn_ips` (many sources in an hour, in many networks) and `conn_link` (a user connecting from a probing
-  IP), alerted as risk events. Node IPs (`node_ip`; a domain name there is resolved by `risk:node-resolve` every minute, see
+  IP), alerted as risk events by `recordOnce()` (once a day per user; a quiet user's 连接 IP 过多 is recorded silent, and
+  alerted once they are no longer quiet). Node IPs
+  (`node_ip`; a domain name there is resolved by `risk:node-resolve` every minute, see
   `RiskAccessService::resolveNodeHosts()`) are left out of the device count and, for users not isolated, of the log.
 - `app/Services/RiskAlertService.php`: keeps alerts from flooding the alert chat. Alerts about one subject (a user, or
   an IP) go out once a day, later ones update that message (`EditRiskAlertJob`, every 5 minutes at most); each kind has
-  a daily budget (`alert_daily_limit`); the jobs send at most 15 messages a minute and wait out Telegram's 429.
+  a daily budget (`alert_daily_limit`); the jobs send at most 15 messages a minute and wait out Telegram's 429. It also
+  counts the alerts not sent for quiet users (`quieted()`, in the daily report).
 - `app/Services/RiskLinkService.php`: links between accounts (checked at registration and by `risk:scan` every 10
   minutes, alerted as risk events with a `detail`, never acted on) and the daily report (`risk:summary`, 00:05).
 - `app/Services/RiskSettings.php`: settings in `v2_risk_setting`, falling back to `.env` (`config/risk.php`);

@@ -174,7 +174,20 @@ class RiskAlertService
     }
 
     /**
-     * How many alerts were left out on the day of $time for going over the daily budget, and how many were merged.
+     * Count a finding not alerted because its user is quiet (免告警), for the daily report.
+     */
+    public function quieted(): void
+    {
+        try {
+            $key = 'risk:alert-quiet:' . date('Ymd');
+            Cache::add($key, 0, self::TTL);
+            Cache::increment($key);
+        } catch (\Throwable $e) { }
+    }
+
+    /**
+     * How many alerts were left out on the day of $time for going over the daily budget, how many were merged, and
+     * how many findings about quiet users were not alerted.
      */
     public function dayCounts(?int $time = null): array
     {
@@ -183,10 +196,11 @@ class RiskAlertService
         try {
             foreach (array_keys(self::KINDS) as $kind) $skipped += (int)Cache::get("risk:alert-skipped:{$kind}:{$day}", 0);
             $merged = (int)Cache::get("risk:alert:merged-total:{$day}", 0);
+            $quiet = (int)Cache::get("risk:alert-quiet:{$day}", 0);
         } catch (\Throwable $e) {
-            $merged = 0;
+            [$merged, $quiet] = [0, 0];
         }
-        return ['skipped' => $skipped, 'merged' => $merged];
+        return ['skipped' => $skipped, 'merged' => $merged, 'quiet' => $quiet];
     }
 
     /**

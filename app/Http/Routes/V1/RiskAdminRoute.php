@@ -25,6 +25,8 @@ class RiskAdminRoute
             $router->get('/user/fetch', 'V1\\Admin\\RiskController@userFetch');
             $router->post('/user/isolate', 'V1\\Admin\\RiskController@userIsolate');
             $router->post('/user/release', 'V1\\Admin\\RiskController@userRelease');
+            $router->post('/user/quiet', 'V1\\Admin\\RiskController@userQuiet');
+            $router->post('/user/unquiet', 'V1\\Admin\\RiskController@userUnquiet');
             $router->get('/event/fetch', 'V1\\Admin\\RiskController@eventFetch');
             $router->get('/access/fetch', 'V1\\Admin\\RiskController@accessFetch');
             $router->get('/access/stats', 'V1\\Admin\\RiskController@accessStats');

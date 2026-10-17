@@ -216,7 +216,8 @@ class RiskController extends Controller
         if ($request->input('id')) {
             $indicator = RiskIndicator::find((int)$request->input('id'));
             if (!$indicator) abort(500, '名单不存在');
-            $value = $service->normalizeIndicatorValue($indicator->type, $request->input('value', $indicator->value));
+            $input = $service->indicatorInput($indicator->type, $request->input('value', $indicator->value));
+            $value = $input === null ? null : $service->normalizeIndicatorValue($indicator->type, $input);
             if ($value === null) abort(500, RiskService::formatHint($indicator->type) ?? '值的格式有误');
             if (RiskIndicator::where('type', $indicator->type)->where('value', $value)->where('id', '!=', $indicator->id)->exists()) {
                 abort(500, '名单里已经有这个值');
@@ -324,15 +325,45 @@ class RiskController extends Controller
         return response(['data' => true]);
     }
 
+    /**
+     * Make a user quiet (免告警): add their email to the quiet indicators. Their findings of RiskService::QUIET_TYPES
+     * are still recorded, not alerted.
+     */
+    public function userQuiet(Request $request)
+    {
+        $user = $this->user($request);
+        try {
+            $this->riskService($request)->quietUser($user, $this->note($request->input('note')));
+        } catch (\InvalidArgumentException $e) {
+            abort(500, '这个用户的邮箱格式无效，无法加入名单');
+        }
+        return response(['data' => true]);
+    }
+
+    /**
+     * Alert about a user again (恢复告警): disable the quiet indicators of their email.
+     */
+    public function userUnquiet(Request $request)
+    {
+        $this->riskService($request)->unquietUser($this->user($request));
+        return response(['data' => true]);
+    }
+
+    /**
+     * The risk events, the latest first; quiet=1: only quiet users' (user_quiet: the user is quiet now).
+     */
     public function eventFetch(Request $request)
     {
         $query = RiskEvent::query();
+        $quiet = (new RiskService())->quietUserIds();
+        if ($request->input('quiet')) $query->whereIn('user_id', $quiet);
         if ($request->input('user_id')) $query->where('user_id', (int)$request->input('user_id'));
         if (is_string($request->input('event_type'))) $query->where('event_type', $request->input('event_type'));
         if (is_string($request->input('ip'))) $query->where('ip', $request->input('ip'));
         $keyword = $this->keyword($request);
         if ($keyword !== null) $query->whereIn('user_id', User::where('email', 'like', $keyword)->select('id'));
-        return $this->paged($request, $query->orderByDesc('last_seen_at')->orderByDesc('id'), function ($events) {
+        return $this->paged($request, $query->orderByDesc('last_seen_at')->orderByDesc('id'), function ($events) use ($quiet) {
+            $quiet = array_flip($quiet);
             $users = User::whereIn('id', $events->pluck('user_id')->filter()->unique()->values())
                 ->get(['id', 'email', 'risk_status'])->keyBy('id');
             $ruleIds = $events->flatMap(function (RiskEvent $event) { return $this->ruleIds($event); })->unique()->values();
@@ -347,13 +378,14 @@ class RiskController extends Controller
             $isNode = $service->access()->nodeMatcher();
             $userCounts = $service->recentUserCounts($events->pluck('ip')->all());
             $info = (new IpInfoService())->lookupMany($events->pluck('ip')->all());
-            return $events->map(function (RiskEvent $event) use ($users, $rules, $dropped, $service, $allowlist, $ipRules, $uaRules, $isNode, $userCounts, $info) {
+            return $events->map(function (RiskEvent $event) use ($users, $rules, $dropped, $service, $allowlist, $ipRules, $uaRules, $isNode, $userCounts, $info, $quiet) {
                 $user = $users->get($event->user_id);
                 return [
                     'id' => $event->id,
                     'user_id' => $event->user_id,
                     'email' => $user ? $user->email : null,
                     'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
+                    'user_quiet' => $user ? isset($quiet[$user->id]) : false,
                     'event_type' => $event->event_type,
                     'ip' => $event->ip,
                     // Whether an enabled allowlist entry (IP 白名单 or 节点 IP) covers the IP now (the event may be from before)
@@ -482,8 +514,8 @@ class RiskController extends Controller
     /**
      * The connection log by user, the most sources first: each user's sources in a date range (see connRange()), with
      * how spread they are (RiskConnService::summarize()), the nodes and how many are probing IPs (probe_hits, null
-     * for the users isolated now: theirs are the probing IPs). The other filters (a user, an IP, see connFilter())
-     * pick the users, whose sources all count.
+     * for the users isolated now: theirs are the probing IPs), and whether they are quiet. The other filters (a user,
+     * an IP, see connFilter()) pick the users, whose sources all count.
      */
     public function connUsers(Request $request)
     {
@@ -507,7 +539,8 @@ class RiskController extends Controller
         foreach ($rows as $userId => $userRows) $summaries[$userId] = $conn->summarize($userRows, $info);
         $servers = $conn->servers(array_merge([], ...array_column($summaries, 'nodes')));
         $probes = $conn->probeUsers($rows->flatten(1)->pluck('ip_net')->filter()->unique()->values()->all());
-        return response(['data' => $page->map(function ($row) use ($users, $summaries, $servers, $rows, $probes) {
+        $quiet = array_flip((new RiskService())->quietUserIds());
+        return response(['data' => $page->map(function ($row) use ($users, $summaries, $servers, $rows, $probes, $quiet) {
             $user = $users->get($row->user_id);
             $isolated = $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false;
             $summary = $summaries[$row->user_id] ?? [];
@@ -516,6 +549,7 @@ class RiskController extends Controller
                 'user_id' => (int)$row->user_id,
                 'email' => $user ? $user->email : null,
                 'user_isolated' => $isolated,
+                'user_quiet' => isset($quiet[$row->user_id]),
                 'reports' => (int)$row->reports,
                 'servers' => array_values(array_intersect_key($servers, array_flip($summary['nodes'] ?? []))),
                 'probe_hits' => $isolated ? null : $nets->filter(function ($net) use ($probes) { return isset($probes[$net]); })->count(),
@@ -525,8 +559,8 @@ class RiskController extends Controller
 
     /**
      * The connection log, the latest first, like accessFetch(): a date range (see connRange()) and the other filters
-     * (see connFilter()). Each row says whether a list covers its source now, whether it is shared, and which users
-     * isolated now connected from it too (a probing IP). Pages of at most 100 rows.
+     * (see connFilter()). Each row says whether a list covers its source now, whether it is shared, which users
+     * isolated now connected from it too (a probing IP), and whether its user is quiet. Pages of at most 100 rows.
      */
     public function connFetch(Request $request)
     {
@@ -545,9 +579,10 @@ class RiskController extends Controller
             $probes = $conn->probeUsers($nets);
             $emails = User::whereIn('id', array_merge([], ...array_map('array_keys', array_values($probes))))->pluck('email', 'id');
             $service = new RiskService();
+            $quiet = array_flip($service->quietUserIds());
             $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->get();
             $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
-            return $rows->map(function (RiskConn $row) use ($users, $info, $isNode, $servers, $shared, $probes, $emails, $service, $allowlist, $ipRules) {
+            return $rows->map(function (RiskConn $row) use ($users, $info, $isNode, $servers, $shared, $probes, $emails, $service, $quiet, $allowlist, $ipRules) {
                 $user = $users->get($row->user_id);
                 $source = $row->ip_net !== '';
                 $owners = array_diff(array_keys($probes[$row->ip_net] ?? []), [(int)$row->user_id]);
@@ -558,6 +593,7 @@ class RiskController extends Controller
                     'user_id' => $row->user_id,
                     'email' => $user ? $user->email : null,
                     'user_isolated' => $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false,
+                    'user_quiet' => isset($quiet[$row->user_id]),
                     'ip' => $row->ip,
                     'ip_net' => $row->ip_net,
                     // A node IP (a relay's address): only kept for isolated users

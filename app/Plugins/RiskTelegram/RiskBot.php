@@ -136,6 +136,7 @@ class RiskBot
     {
         $result = $operator->service()->addIndicators($type, $values);
         $notes = $type === 'email' && $result['added'] ? $this->usersLine('🔒 已隔离', $result['added'], true) : [];
+        if ($type === 'quiet' && $result['added']) $notes[] = $this->view->escape('🔕 ' . RiskView::quietNotice(implode('、', $result['added'])));
         if (RiskService::formatHint($type) !== null && $result['invalid']) $notes[] = $this->view->escape(RiskService::formatHint($type));
         $this->reply($message, $this->view->result([
             '✅ 新增' => $result['added'], '⚠️ 已存在' => $result['existing'], '❌ 格式无效' => $result['invalid'],
@@ -151,7 +152,9 @@ class RiskBot
         $service = $operator->service();
         $deleted = $missing = [];
         foreach ($values as $rawValue) {
-            $value = $service->normalizeIndicatorValue($type, $rawValue) ?? trim((string)$rawValue);
+            // A quiet user may be given by uid
+            $input = $service->indicatorInput($type, $rawValue) ?? trim((string)$rawValue);
+            $value = $service->normalizeIndicatorValue($type, $input) ?? trim((string)$rawValue);
             // Also as typed: IPs added before they were stored in their standard form
             $indicator = RiskIndicator::where('type', $type)->whereIn('value', array_unique([$value, trim((string)$rawValue)]))
                 ->where('enabled', 1)->first();
@@ -188,7 +191,7 @@ class RiskBot
             case 'NA': return $this->addAutoNodes($context, $operator);
         }
         if (in_array($verb, ['p', 'P', 'k', 'w', 'W', 'g', 'G'], true)) return $this->eventAction($verb, RiskEvent::find($int(2)), $context, $operator);
-        if (!in_array($verb, ['c', 'cr', 'ue', 'cnr', 'i', 'r', 'I', 'R', 'x', 's', 'S', 't', 'T'], true)) return '';
+        if (!in_array($verb, ['c', 'cr', 'ue', 'cnr', 'i', 'r', 'I', 'R', 'x', 's', 'S', 't', 'T', 'q', 'Q', 'v', 'V'], true)) return '';
 
         $card = in_array($verb, ['c', 'cr', 'ue', 'cnr'], true);
         $user = User::find($card ? $int(2) : $int(3));
@@ -216,7 +219,7 @@ class RiskBot
 
     /**
      * From an alert ('a') or a user card ('c'): isolating or releasing a user, resetting their subscription, letting
-     * their subscriptions through today. Ask first, then do it.
+     * their subscriptions through today, making them quiet (免告警) or alerting about them again. Ask first, then do it.
      */
     private function userAction(string $verb, string $where, User $user, ?RiskEvent $event, $context, RiskOperator $operator): string
     {
@@ -231,6 +234,12 @@ class RiskBot
                 '用户本人要在所有设备上重新导入订阅。';
         }
         if ($verb === 't') return $this->askToConfirm($context, "确认今天放行 {$email}", "r:T:{$suffix}", "r:x:{$suffix}");
+        if ($verb === 'q') {
+            $this->askToConfirm($context, "确认免告警 {$email}", "r:Q:{$suffix}", "r:x:{$suffix}");
+            $context->alert = true;
+            return RiskView::quietNotice($email);
+        }
+        if ($verb === 'v') return $this->askToConfirm($context, "确认恢复告警 {$email}", "r:V:{$suffix}", "r:x:{$suffix}");
 
         $service = $operator->service();
         $notice = '';
@@ -262,6 +271,24 @@ class RiskBot
         } elseif ($verb === 'T') {
             $service->exemptToday($user);
             [$notice, $line] = ['今天不再限制这个用户的订阅', '✅ 今天已放行'];
+        } elseif ($verb === 'Q') {
+            if ($service->isQuiet($user)) {
+                $notice = '已经是免告警';
+            } else {
+                try {
+                    $service->quietUser($user, $where === 'a' ? '从告警加入' : '从用户卡片加入');
+                } catch (\InvalidArgumentException $e) {
+                    return '邮箱格式无效，无法加入免告警';
+                }
+                [$notice, $line] = ['已免告警：照样记录，连接和订阅的告警不再发', '🔕 已免告警'];
+            }
+        } elseif ($verb === 'V') {
+            if (!$service->isQuiet($user)) {
+                $notice = '这个用户没有免告警';
+            } else {
+                $service->unquietUser($user);
+                [$notice, $line] = ['已恢复告警', '🔔 已恢复告警'];
+            }
         }
         $user->refresh();
         if ($where === 'c') {

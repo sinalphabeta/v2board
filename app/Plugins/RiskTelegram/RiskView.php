@@ -27,6 +27,7 @@ use App\Services\RiskSettings;
  *   r:n:<ip> the users of an IP, as a new reply (the IP's colons as dashes: the data is split at colons)
  *   r:i|r:<ctx>:<uid>:<eid> ask to isolate / release, r:I|R:… do it, r:x:… cancel (ctx: a alert, c user card)
  *   r:s|t:<ctx>:<uid>:<eid> ask to reset the subscription / let it through today, r:S|T:… do it
+ *   r:q|v:<ctx>:<uid>:<eid> ask to make the user quiet (免告警) / alert about them again, r:Q|V:… do it
  *   r:p:<eid> ask to list the event's IP, r:P:<eid> do it · r:k:<eid> mark the alert handled
  *   r:w:<eid> ask to allowlist the event's IP, r:W:<eid> do it · r:g:<eid> ask to add it to the node IPs, r:G:<eid> do it
  *   r:na ask to add the node IPs found by the node APIs, r:NA do it
@@ -64,7 +65,10 @@ class RiskView
     private const LIST_ABOUT = [
         'allow_ip' => '这些 IP 命中 IP、ASN 名单不告警，UA、邮箱名单照常',
         'node_ip' => '节点的出口 IP、中转机的 IP 或域名：和 IP 白名单一样，命中 IP、ASN 名单不告警，关联检测和日报的多地区也跳过；UA、邮箱名单照常。域名每分钟解析一次',
+        'quiet' => self::QUIET_ABOUT,
     ];
+    // What 免告警 does, for the list and the confirmation
+    private const QUIET_ABOUT = '照样记录；连接 IP 过多、订阅过频、订阅超限只记风险事件、不发 Bot。适合把套餐分享给朋友的用户';
     // How many of the node IPs found by the node APIs the node IP list shows
     private const AUTO_NODES_SHOWN = 10;
     // Tells a node's exit IP (RiskAccessService::nodeMatcher()), made once per view
@@ -83,7 +87,7 @@ class RiskView
             [$this->button('🧩 UA 名单', 'r:l:ua:1'), $this->button('🏢 ASN 名单', 'r:l:asn:1')],
             [$this->button('🟢 IP 白名单', 'r:l:allow_ip:1'), $this->button('🛰 节点 IP', 'r:l:node_ip:1')],
             [$this->button('📊 今日概况', 'r:d'), $this->button('📝 操作记录', 'r:a:1')],
-            [$this->button('🩺 系统状态', 'r:h')],
+            [$this->button('🔕 免告警用户', 'r:l:quiet:1'), $this->button('🩺 系统状态', 'r:h')],
         ]);
     }
 
@@ -126,8 +130,13 @@ class RiskView
         $query = RiskIndicator::where('type', $type)->where('enabled', 1)->orderBy('value');
         [$indicators, $page, $pages, $total] = $this->paginate($query, $page, $type === 'ua' ? 10 : 20);
         $hosts = $type === 'node_ip' ? (new RiskAccessService())->nodeHosts() : [];
-        $lines = $indicators->map(function (RiskIndicator $indicator) use ($hosts) {
+        // A quiet user's uid, to open the card with
+        $uids = $type === 'quiet' ? User::whereIn('email', $indicators->pluck('value')->all())->pluck('id', 'email')
+            ->mapWithKeys(function ($id, $email) { return [strtolower(trim((string)$email)) => $id]; }) : collect();
+        $lines = $indicators->map(function (RiskIndicator $indicator) use ($hosts, $uids) {
+            $uid = $uids[$indicator->value] ?? null;
             return '• ' . $this->code($indicator->value) . $this->hostLine($hosts, (string)$indicator->value) .
+                ($uid ? ' · uid ' . $this->code($uid) : '') .
                 ($indicator->note ? ' — ' . $this->escape($this->shorten($indicator->note, 40)) : '');
         })->all();
         $about = isset(self::LIST_ABOUT[$type]) ? "\n" . $this->escape(self::LIST_ABOUT[$type]) : '';
@@ -238,6 +247,7 @@ class RiskView
                 '/addasn、/delasn、/listasn  AS 号',
                 '/addallow、/delallow、/listallow  IP 白名单：命中 IP、ASN 名单不告警',
                 '/addnode、/delnode、/listnode  节点 IP：节点的出口、中转机的 IP 或域名，和白名单一样',
+                '/addquiet、/delquiet、/listquiet  免告警用户：邮箱或 uid，照样记录，连接和订阅的告警不发',
                 '/list  邮箱名单',
                 '/edit 值或ID 备注  修改备注',
             ],
@@ -256,7 +266,7 @@ class RiskView
                 return $this->escape($line);
             }, $lines));
         }
-        $text .= "\n\n" . $this->escape('回复一条告警或用户卡片发 /add、/del、/search，回复一条告警发 /addip、/delip、/addallow、/addnode，可以不写参数。') .
+        $text .= "\n\n" . $this->escape('回复一条告警或用户卡片发 /add、/del、/search、/addquiet、/delquiet，回复一条告警发 /addip、/delip、/addallow、/addnode，可以不写参数。') .
             "\n" . $this->escape('用户卡片和告警上的「重置订阅」会换掉订阅链接和 UUID，分享出去的立刻失效；用户本人要重新导入订阅。') .
             "\n" . $this->escape('/del、/delip 这些是停用：名单还在，管理面板里能重新启用；要彻底删掉，在管理面板的风险名单里删。');
         return $this->view($text, [[$this->button('🏠 菜单', 'r:m')]]);
@@ -279,6 +289,8 @@ class RiskView
             '风险状态: ' . $this->riskStatus($user),
             '今天订阅: ' . $this->escape($this->todayLine($user)),
         ];
+        $quiet = (new RiskService())->quietEntry($user);
+        if ($quiet) $lines[] = $this->escape('🔕 免告警' . ($quiet->note ? "（{$this->shorten($quiet->note, 40)}）" : ''));
         $registration = (new RiskAccessService())->registration($user);
         if ($registration) $lines[] = '注册 IP: ' . $this->code($registration->ip);
         $old = (new RiskAccessService())->oldLinks($user);
@@ -304,6 +316,7 @@ class RiskView
         $rows = [[
             $this->isolated($user) ? $this->button('🔓 解除隔离', "r:r:c:{$user->id}") : $this->button('🔒 隔离', "r:i:c:{$user->id}"),
             $this->button('♻️ 重置订阅', "r:s:c:{$user->id}"),
+            $this->quietButton($user, 'c', ''),
         ]];
         if ($this->limitedToday($user)) $rows[] = [$this->button('✅ 今天放行', "r:t:c:{$user->id}")];
         $rows[] = [
@@ -369,14 +382,15 @@ class RiskView
     public function searchResults($users, string $query, array $usage = []): array
     {
         $byIp = (bool)filter_var($query, FILTER_VALIDATE_IP);
-        $days = (new RiskService())->searchDays();
+        $risk = new RiskService();
+        $days = $risk->searchDays();
         $note = $byIp ? "\n" . $this->escape("最近 {$days} 天" . (strpos($query, ':') !== false ? '，IPv6 按它所在的 /64 查' : '')) : '';
         if (!$users->count()) return $this->view('未找到：' . $this->code($query) . $note, []);
         $lines = [];
         $buttons = [];
         foreach ($users->values() as $i => $user) {
             $line = ($i + 1) . '\\. ' . $this->code($user->email) . ' · uid ' . $this->code($user->id) .
-                ($this->isolated($user) ? ' · 🔒 已隔离' : '');
+                ($this->isolated($user) ? ' · 🔒 已隔离' : '') . ($risk->isQuiet($user) ? ' · 🔕 免告警' : '');
             if (isset($usage[$user->id])) $line .= "\n" . $this->escape('   ' . $this->usageText($usage[$user->id]));
             $lines[] = $line;
             $buttons[] = [$this->button(($i + 1) . '. ' . $this->shorten($user->email, 40), "r:c:{$user->id}")];
@@ -390,7 +404,8 @@ class RiskView
      * allowlists can be added to the IP list or allowlisted, on its own row so as not to be taken for the other; one in
      * a listed range can still be let through by replying /addallow. An IP the node APIs were called from is a node's
      * exit, shared by everyone coming through the node: it is offered for the node IPs instead. Alerts of what a check
-     * found (RiskService::FINDING_TYPES) also offer what fits them: the IP's users, 今天放行, 重置订阅.
+     * found (RiskService::FINDING_TYPES) also offer what fits them, up to 3 a row: the IP's users, 今天放行, 重置订阅,
+     * and 免告警 for RiskService::QUIET_TYPES.
      */
     public function alertKeyboard(User $user, ?RiskEvent $event): array
     {
@@ -417,7 +432,8 @@ class RiskView
             if (in_array($event->event_type, ['sub_limit', 'ip_users', 'sub_burst', 'conn_ips'], true)) {
                 $finding[] = $this->button('♻️ 重置订阅', "r:s:a:{$user->id}:{$eventId}");
             }
-            if ($finding) $rows[] = $finding;
+            if (in_array($event->event_type, RiskService::QUIET_TYPES, true)) $finding[] = $this->quietButton($user, 'a', (string)$eventId);
+            foreach (array_chunk($finding, 3) as $row) $rows[] = $row;
             $risk = new RiskService();
             $ip = (string)$event->ip;
             $open = $risk->allowRangeFor($ip) !== null && !$risk->allowEntryFor($ip) && !$risk->ipEntryFor($ip);
@@ -447,9 +463,10 @@ class RiskView
                 "注册 {$data['registrations']} · 下单 {$data['orders']} · 支付 {$data['paid']}"),
             $this->escape("风险事件 {$data['events']} 条 · 新隔离 {$data['isolated']} 人 · 订阅超限 {$data['limited']} 人 · " .
                 "订阅过频 {$data['bursts']} 人 · " .
-                "关联告警 {$data['link_alerts']} 条 · 连接告警 " . ($data['conn_alerts'] ?? 0) . ' 条' . ($data['merged_alerts'] || $data['skipped_alerts']
-                    ? "（合并 {$data['merged_alerts']} 条、超出每天上限没发 {$data['skipped_alerts']} 条）" : '')),
+                "关联告警 {$data['link_alerts']} 条 · 连接告警 " . ($data['conn_alerts'] ?? 0) . ' 条' . $this->alertsNote($data)),
         ];
+        // Users sharing a plan with friends would fill the lists of many places and sources
+        $notQuiet = !empty($data['quiet_users']) ? '（不含免告警的）' : '';
         $users = [];
         $user = function (array $row) use (&$users): string {
             $users[$row['user_id']] = $row['email'] ?? null;
@@ -464,7 +481,7 @@ class RiskView
                 return $this->code($row['ip_net']) . ($where !== '' ? ' ' . $this->escape($where) : '') .
                     $this->escape(" · {$row['users']} 人" . ($row['isolated'] ? "（含已隔离 {$row['isolated']}）" : ''));
             }, $data['shared_ips']),
-            '多地区' => array_map(function ($row) use ($user) {
+            "多地区{$notQuiet}" => array_map(function ($row) use ($user) {
                 return $user($row) . $this->escape(" {$row['places']} 个地区 · {$row['asns']} 个 ASN");
             }, $data['regions']),
             '密码错误最多' => array_map(function ($row) use ($user) {
@@ -477,7 +494,7 @@ class RiskView
             '旧链接还在被拉' => array_map(function ($row) use ($user) {
                 return $user($row) . $this->escape(" {$row['total']} 次 · {$row['ips']} 个 IP");
             }, $data['old_links'] ?? []),
-            '连接 IP 最多' => array_map(function ($row) use ($user) {
+            "连接 IP 最多{$notQuiet}" => array_map(function ($row) use ($user) {
                 return $user($row) . $this->escape(" {$row['sources']} 个 IP · {$row['segments']} 个网段 · {$row['provinces']} 个地区");
             }, $data['conn_top'] ?? []),
         ];
@@ -495,9 +512,37 @@ class RiskView
         return $this->view(implode("\n", $lines), $keyboard);
     }
 
+    /**
+     * 🔕 免告警, or 🔔 恢复告警 for a quiet user, on a user card ('c') or an alert ('a', with its event).
+     */
+    private function quietButton(User $user, string $where, string $eventId): array
+    {
+        $suffix = "{$where}:{$user->id}" . ($where === 'a' ? ":{$eventId}" : '');
+        return (new RiskService())->isQuiet($user) ? $this->button('🔔 恢复告警', "r:v:{$suffix}") : $this->button('🔕 免告警', "r:q:{$suffix}");
+    }
+
+    /**
+     * What 免告警 does, for the confirmation dialog (at most 200 characters).
+     */
+    public static function quietNotice(string $email): string
+    {
+        return "免告警 {$email}：" . self::QUIET_ABOUT . '。随时能在风险名单、用户卡片上恢复。';
+    }
+
     public function confirmKeyboard(string $label, string $confirm, string $cancel): array
     {
         return [[$this->button('✅ ' . $label, $confirm), $this->button('取消', $cancel)]];
+    }
+
+    /**
+     * The alerts not sent, after the report's counts: merged, over the daily budget, about quiet users.
+     */
+    private function alertsNote(array $data): string
+    {
+        $notes = [];
+        if ($data['merged_alerts'] || $data['skipped_alerts']) $notes[] = "合并 {$data['merged_alerts']} 条、超出每天上限没发 {$data['skipped_alerts']} 条";
+        if (!empty($data['quiet_alerts'])) $notes[] = "免告警的 {$data['quiet_alerts']} 条没发";
+        return $notes ? '（' . implode('；', $notes) . '）' : '';
     }
 
     /**
