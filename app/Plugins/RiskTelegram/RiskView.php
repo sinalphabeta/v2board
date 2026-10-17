@@ -51,7 +51,7 @@ class RiskView
         'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
         'alert_daily_limit' => '每类告警每天上限', 'sub_burst_limit' => '10 分钟订阅次数告警',
         'conn_log_enabled' => '连接记录', 'conn_log_days' => '连接记录保留天数', 'conn_ip_limit' => '1 小时连接 IP 数告警',
-        'conn_link_ips' => '命中测活 IP 告警',
+        'conn_link_ips' => '命中测活 IP 告警', 'conn_link_loose' => '测活 IP 按网段匹配',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
@@ -68,7 +68,7 @@ class RiskView
         'quiet' => self::QUIET_ABOUT,
     ];
     // What 免告警 does, for the list and the confirmation
-    private const QUIET_ABOUT = '照样记录；连接 IP 过多、订阅过频、订阅超限只记风险事件、不发 Bot。适合把套餐分享给朋友的用户';
+    private const QUIET_ABOUT = '照样记录；连接 IP 过多、订阅过频、订阅超限只记风险事件、不发 Bot，命中测活 IP 只发同一个 IP 的。适合把套餐分享给朋友的用户';
     // How many of the node IPs found by the node APIs the node IP list shows
     private const AUTO_NODES_SHOWN = 10;
     // Tells a node's exit IP (RiskAccessService::nodeMatcher()), made once per view

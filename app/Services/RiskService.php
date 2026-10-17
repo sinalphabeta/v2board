@@ -38,7 +38,8 @@ class RiskService
     ];
     /**
      * The findings that are recorded but not alerted for a quiet user (免告警, e.g. one sharing a plan with friends):
-     * many sources, many subscriptions. 命中测活 IP still alerts: someone they share the plan with may be the probe.
+     * many sources, many subscriptions. 命中测活 IP is only kept quiet when it is near a probing IP, not on one
+     * (RiskConnService::scanProbes()).
      */
     public const QUIET_TYPES = ['sub_limit', 'sub_burst', 'conn_ips'];
     /**

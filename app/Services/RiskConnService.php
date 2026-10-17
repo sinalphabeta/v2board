@@ -355,7 +355,8 @@ class RiskConnService
 
     /**
      * risk:scan, every 10 minutes: alert users with many sources in the last hour (conn_ips) and users connecting from
-     * the probing IPs (conn_link); each check fails alone. Only alerted, never acted on. Returns how many were alerted.
+     * or near the probing IPs (conn_link); each check fails alone. Only alerted, never acted on. Returns how many were
+     * alerted.
      */
     public function scan(): int
     {
@@ -415,35 +416,58 @@ class RiskConnService
 
     /**
      * 命中测活 IP: a user (not isolated, not an admin) connecting today from conn_link_ips or more probing IPs (see
-     * probeUsers()); under the link checks' switch. It alerts for quiet users too: someone they share the plan with may
-     * be the probe.
+     * probeUsers()), and with conn_link_loose from sources near them as well (nearProbes()); under the link checks'
+     * switch. Only the sources near a probing IP of a quiet user are kept quiet: one on a probing IP alerts all the same.
      */
     private function scanProbes(): int
     {
         $threshold = (int)RiskSettings::get('conn_link_ips');
         if ($threshold <= 0 || !RiskSettings::get('link_detection')) return 0;
-        // Today's sources of users not isolated that an isolated user connected from too
-        $rows = RiskConn::where('record_at', $this->access()->day(time()))->where('ip_net', '!=', '')
-            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->select('id'))
-            ->whereExists(function ($query) {
+        $loose = (bool)RiskSettings::get('conn_link_loose');
+        $query = RiskConn::where('record_at', $this->access()->day(time()))->where('ip_net', '!=', '')
+            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->select('id'));
+        // Today's sources of users not isolated that an isolated user connected from too, or all of them when the ones
+        // near the probing IPs count as well
+        if (!$loose) {
+            $query->whereExists(function ($query) {
                 $query->select(DB::raw(1))->from('v2_risk_conn as probe')->join('v2_user as owner', 'owner.id', '=', 'probe.user_id')
                     ->whereColumn('probe.ip_net', 'v2_risk_conn.ip_net')->where('owner.risk_status', RiskService::STATUS_RISK);
-            })->get();
+            });
+        }
+        $rows = $query->get();
         if (!$rows->count()) return 0;
         $probes = $this->probeUsers($rows->pluck('ip_net')->unique()->values()->all());
+        $near = $loose ? $this->nearProbes($rows->pluck('ip', 'ip_net')->all()) : [];
         $users = User::whereIn('id', $rows->pluck('user_id')->unique()->values())->where('is_admin', 0)->get()->keyBy('id');
         $alerted = 0;
         foreach ($rows->groupBy('user_id') as $userId => $userRows) {
-            $hits = $userRows->filter(function (RiskConn $row) use ($probes) { return isset($probes[$row->ip_net]); })->unique('ip_net')->values();
-            if (!$users->has($userId) || $hits->count() < $threshold) continue;
-            $detail = '今天 ' . $hits->count() . ' 个连接 IP 是测活 IP：' . $hits->take(3)->map(function (RiskConn $row) use ($probes) {
+            $sources = $userRows->unique('ip_net')->values();
+            $hits = $sources->filter(function (RiskConn $row) use ($probes) { return isset($probes[$row->ip_net]); })->values();
+            $nearHits = $sources->filter(function (RiskConn $row) use ($probes, $near) {
+                return !isset($probes[$row->ip_net]) && isset($near[$row->ip_net]);
+            })->values();
+            if (!$users->has($userId) || $hits->count() + $nearHits->count() < $threshold) continue;
+            // As plain collections: an empty Eloquent one stays one after map(), and its merge() takes models
+            $found = $hits->toBase()->map(function (RiskConn $row) use ($probes) {
                 $by = $probes[$row->ip_net];
                 arsort($by);
                 $owner = array_key_first($by);
                 return $row->ip_net . (strpos($row->ip_net, ':') !== false ? '（IPv6 /64）' : '（IPv4）') .
                     " 被已隔离用户 uid {$owner} 用过，最后 " . date('m-d', $by[$owner]);
-            })->implode('；');
-            if ($this->recordOnce($users->get($userId), 'conn_link', (string)$hits->first()->ip, $detail, false)) $alerted++;
+            })->merge($nearHits->toBase()->map(function (RiskConn $row) use ($near) {
+                $probe = $near[$row->ip_net];
+                return "{$row->ip_net} 和测活 IP {$probe['probe']} 在同一个 /" . explode('/', $probe['net'])[1] .
+                    "，被已隔离用户 uid {$probe['user_id']} 用过，最后 " . date('m-d', $probe['last_seen_at']);
+            }));
+            $counts = array_filter([
+                $hits->count() ? $hits->count() . ' 个连接 IP 是测活 IP' : null,
+                $nearHits->count() ? $nearHits->count() . ' 个和测活 IP 在同一网段' : null,
+            ]);
+            $detail = '今天 ' . implode('、', $counts) . '：' . $found->take(3)->implode('；');
+            $user = $users->get($userId);
+            $first = $hits->first() ?? $nearHits->first();
+            $quiet = !$hits->count() && $this->risk()->isQuiet($user);
+            if ($this->recordOnce($user, 'conn_link', (string)$first->ip, $detail, $quiet)) $alerted++;
         }
         return $alerted;
     }
@@ -451,8 +475,8 @@ class RiskConnService
     /**
      * Record a finding about the user, alerted once in 24 hours (not by the date: a check before and after midnight
      * would alert twice); later scans update the same event, without alerting. A quiet user's ($quiet) is recorded
-     * silent: it alerts once a later scan finds them no longer quiet, within the same 24 hours. Returns whether it
-     * alerted.
+     * silent: it alerts once a later scan finds them no longer quiet (or, for 命中测活 IP, on a probing IP), within the
+     * same 24 hours. Returns whether it alerted.
      */
     private function recordOnce(User $user, string $type, string $ip, string $detail, bool $quiet): bool
     {
@@ -508,8 +532,105 @@ class RiskConnService
     }
 
     /**
+     * Which of these sources of users not isolated ([ip_net => ip]) are near a probing IP without being one: in the
+     * same network (nearNet(): an IPv4 /24, an IPv6 /48) as a source of a user isolated now, as when a probe redials
+     * and gets an address nearby, or several machines probe from one place. [ip_net => ['probe' => that probing IP
+     * (the latest of the network), 'user_id' => its isolated user, 'last_seen_at', 'net' => the network, 'users' => the
+     * isolated users of the network's probing IPs]]. Left out like probeUsers() on both sides (allowlisted, node IPs,
+     * private; shared probing IPs), and shared networks: SHARED_USERS or more users not isolated in SHARED_DAYS days (a
+     * carrier's mobile exits, a campus).
+     */
+    public function nearProbes(array $sources): array
+    {
+        $keys = [];
+        foreach ($sources as $net => $ip) {
+            $key = $this->nearKey((string)$net);
+            if ($key !== null) $keys[$key][] = (string)$net;
+        }
+        if (!$keys) return [];
+        $sql = self::nearKeySql('`ip_net`');
+        $rows = RiskConn::whereIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->select('id'))->where('ip_net', '!=', '')
+            // As strings: a key of digits only is an integer in PHP, and SQL would compare the others as numbers too
+            ->whereRaw("{$sql} IN (" . implode(', ', array_fill(0, count($keys), '?')) . ')', array_map('strval', array_keys($keys)))
+            ->selectRaw('ip_net, user_id, MAX(ip) AS ip, MAX(last_seen_at) AS last_seen_at')->groupBy('ip_net', 'user_id')->get();
+        if (!$rows->count()) return [];
+        $exclude = $this->risk()->links()->excluder();
+        $shared = $this->sharedNets($rows->pluck('ip_net')->unique()->values()->all());
+        $probes = [];
+        foreach ($rows as $row) {
+            if (isset($shared[$row->ip_net]) || $exclude((string)$row->ip, (string)$row->ip_net)) continue;
+            $probes[$this->nearKey((string)$row->ip_net)][] = $row;
+        }
+        $crowded = $this->sharedNear(array_keys($probes));
+        $near = [];
+        foreach ($probes as $key => $probeRows) {
+            if (isset($crowded[$key])) continue;
+            foreach ($keys[$key] as $net) {
+                if ($exclude((string)$sources[$net], $net)) continue;
+                // The same source is a probing IP itself (probeUsers()), the others are near it
+                $others = collect($probeRows)->reject(function ($row) use ($net) { return (string)$row->ip_net === $net; });
+                if (!$others->count()) continue;
+                $latest = $others->sortByDesc('last_seen_at')->first();
+                $near[$net] = [
+                    'probe' => (string)$latest->ip_net, 'user_id' => (int)$latest->user_id, 'last_seen_at' => (int)$latest->last_seen_at,
+                    'net' => $this->nearNet($net),
+                    'users' => $others->pluck('user_id')->map(function ($id) { return (int)$id; })->unique()->values()->all(),
+                ];
+            }
+        }
+        return $near;
+    }
+
+    /**
+     * Which of these networks (nearKey()) are shared: [key => users] for SHARED_USERS or more users not isolated in the
+     * last SHARED_DAYS days, from any of their sources.
+     */
+    private function sharedNear(array $keys): array
+    {
+        if (!$keys) return [];
+        $sql = self::nearKeySql('`ip_net`');
+        return RiskConn::where('record_at', '>=', $this->access()->day(time()) - (self::SHARED_DAYS - 1) * 86400)->where('ip_net', '!=', '')
+            ->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->select('id'))
+            ->whereRaw("{$sql} IN (" . implode(', ', array_fill(0, count($keys), '?')) . ')', array_map('strval', $keys))
+            ->selectRaw("{$sql} AS near_key, COUNT(DISTINCT user_id) AS users")->groupBy('near_key')
+            ->havingRaw('COUNT(DISTINCT user_id) >= ?', [self::SHARED_USERS])->pluck('users', 'near_key')->all();
+    }
+
+    /**
+     * The network around a source for nearProbes(), as a CIDR in its standard form: an IPv4 address's /24
+     * (221.0.5.0/24), an IPv6 /64's /48 (2409:8a55:2d24::/48). Null for no address.
+     */
+    public function nearNet(string $ipNet): ?string
+    {
+        $ip = explode('/', $ipNet)[0];
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) return null;
+        return $this->risk()->normalizeIndicatorValue('ip', $ip . (strpos($ip, ':') === false ? '/24' : '/48'));
+    }
+
+    /**
+     * The network around a source as nearKeySql() computes it: the first 3 bytes of an IPv4 address, the first 6 of an
+     * IPv6 one, in hex (DD0005). From the address in binary: its text may be shortened (2409:8a55::/64).
+     */
+    public function nearKey(string $ipNet): ?string
+    {
+        $ip = explode('/', $ipNet)[0];
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) return null;
+        $binary = inet_pton($ip);
+        return strtoupper(bin2hex(substr($binary, 0, strlen($binary) === 4 ? 3 : 6)));
+    }
+
+    /**
+     * nearKey() in SQL for a column of sources (an IP, or an IPv6 /64).
+     */
+    private static function nearKeySql(string $column): string
+    {
+        return "HEX(SUBSTRING(INET6_ATON(SUBSTRING_INDEX({$column}, '/', 1)), 1, IF(LOCATE(':', {$column}) > 0, 6, 3)))";
+    }
+
+    /**
      * The probing IPs page by page, the latest first: the sources of the users isolated now, each with those users,
-     * the nodes, when, how many users not isolated connected from it in the last SHARED_DAYS days, and why it does
+     * the nodes, when, how many users not isolated connected from it in the last SHARED_DAYS days (others) and from
+     * other sources of its network (others_near, see nearProbes(); near_shared: that network is shared), and why it does
      * not count, if so (node: a node IP; allow: allowlisted; shared). $ip: that source only. Returns [rows, total].
      */
     public function probes(int $page, int $size, ?string $ip = null): array
@@ -522,12 +643,19 @@ class RiskConnService
             . ' SUM(reports) AS reports')->groupBy('ip_net')->orderByDesc('last_seen_at')->forPage($page, $size)->get();
         $nets = $rows->pluck('ip_net')->all();
         $owners = $nets ? RiskConn::whereIn('ip_net', $nets)->whereIn('user_id', $isolated)->get(['ip_net', 'user_id', 'servers'])->groupBy('ip_net') : collect();
-        $others = $nets ? RiskConn::whereIn('ip_net', $nets)->where('record_at', '>=', $this->access()->day(time()) - (self::SHARED_DAYS - 1) * 86400)
+        $since = $this->access()->day(time()) - (self::SHARED_DAYS - 1) * 86400;
+        $others = $nets ? RiskConn::whereIn('ip_net', $nets)->where('record_at', '>=', $since)
             ->whereNotIn('user_id', $isolated)->selectRaw('ip_net, COUNT(DISTINCT user_id) AS users')->groupBy('ip_net')->pluck('users', 'ip_net') : collect();
+        // Who connected from the same networks (nearNet())
+        $keys = array_values(array_unique(array_filter(array_map(function ($net) { return $this->nearKey((string)$net); }, $nets))));
+        $sql = self::nearKeySql('`ip_net`');
+        $nearby = $keys ? RiskConn::where('record_at', '>=', $since)->where('ip_net', '!=', '')->whereNotIn('user_id', $isolated)
+            ->whereRaw("{$sql} IN (" . implode(', ', array_fill(0, count($keys), '?')) . ')', array_map('strval', $keys))
+            ->selectRaw("{$sql} AS near_key, ip_net, user_id")->distinct()->get()->groupBy('near_key') : collect();
         $isNode = $this->access()->nodeMatcher();
         $allowed = [];
         foreach (RiskIndicator::where('type', 'allow_ip')->where('enabled', 1)->get() as $entry) $allowed[] = $entry;
-        $data = $rows->map(function ($row) use ($owners, $others, $isNode, $allowed) {
+        $data = $rows->map(function ($row) use ($owners, $others, $nearby, $isNode, $allowed) {
             $mine = $owners->get($row->ip_net, collect());
             $users = (int)($others[$row->ip_net] ?? 0);
             $allow = false;
@@ -535,12 +663,15 @@ class RiskConnService
                 if ($this->risk()->entryMatches((string)$row->ip, $entry) || $this->risk()->ipRangeWithin((string)$row->ip_net, (string)$entry->value)) $allow = true;
             }
             $why = $isNode((string)$row->ip, (string)$row->ip_net) ? 'node' : ($allow ? 'allow' : ($users >= self::SHARED_USERS ? 'shared' : null));
+            $network = $nearby->get($this->nearKey((string)$row->ip_net), collect());
             return [
                 'ip_net' => (string)$row->ip_net, 'ip' => (string)$row->ip,
                 'users' => $mine->pluck('user_id')->unique()->values()->all(),
                 'nodes' => $mine->flatMap(function ($r) { return array_filter(explode(',', (string)$r->servers)); })->unique()->values()->all(),
                 'first_seen_at' => (int)$row->first_seen_at, 'last_seen_at' => (int)$row->last_seen_at, 'reports' => (int)$row->reports,
                 'others' => $users, 'excluded' => $why,
+                'others_near' => $network->where('ip_net', '!=', (string)$row->ip_net)->pluck('user_id')->unique()->count(),
+                'near_shared' => $network->pluck('user_id')->unique()->count() >= self::SHARED_USERS,
             ];
         })->all();
         return [$data, $total];

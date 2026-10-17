@@ -43,6 +43,8 @@ class RiskSettings
         'conn_ip_limit' => 10,
         // 命中测活 IP: the probing IPs (isolated users' sources) a user connected from today that alert; 0: not checked
         'conn_link_ips' => 1,
+        // 测活 IP 按网段匹配: a source in the same IPv4 /24 or IPv6 /48 as a probing IP counts too
+        'conn_link_loose' => false,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;

@@ -122,7 +122,7 @@ class RiskController extends Controller
             if ($invalid) abort(500, '可信代理里这些不是 IP 或 CIDR：' . implode('、', $invalid));
             $values['trusted_proxies'] = implode(',', array_unique($proxies));
         }
-        foreach (['access_log_enabled', 'link_detection', 'daily_report', 'conn_log_enabled'] as $name) {
+        foreach (['access_log_enabled', 'link_detection', 'daily_report', 'conn_log_enabled', 'conn_link_loose'] as $name) {
             if (!$request->has($name)) continue;
             $enabled = (string)$request->input($name);
             // An admin panel older than a switch sends the value it fetched, form-encoded: true / false
@@ -513,9 +513,9 @@ class RiskController extends Controller
 
     /**
      * The connection log by user, the most sources first: each user's sources in a date range (see connRange()), with
-     * how spread they are (RiskConnService::summarize()), the nodes and how many are probing IPs (probe_hits, null
-     * for the users isolated now: theirs are the probing IPs), and whether they are quiet. The other filters (a user,
-     * an IP, see connFilter()) pick the users, whose sources all count.
+     * how spread they are (RiskConnService::summarize()), the nodes and how many are probing IPs (probe_hits) or near
+     * one (probe_near_hits, RiskConnService::nearProbes()), null for the users isolated now: theirs are the probing
+     * IPs. The other filters (a user, an IP, see connFilter()) pick the users, whose sources all count.
      */
     public function connUsers(Request $request)
     {
@@ -539,8 +539,11 @@ class RiskController extends Controller
         foreach ($rows as $userId => $userRows) $summaries[$userId] = $conn->summarize($userRows, $info);
         $servers = $conn->servers(array_merge([], ...array_column($summaries, 'nodes')));
         $probes = $conn->probeUsers($rows->flatten(1)->pluck('ip_net')->filter()->unique()->values()->all());
+        $isolatedIds = $users->filter(function (User $user) { return (int)$user->risk_status === RiskService::STATUS_RISK; })->keys()->all();
+        // By user id: Eloquent's except() goes by the models' keys
+        $near = $conn->nearProbes($rows->toBase()->except($isolatedIds)->flatten(1)->where('ip_net', '!=', '')->pluck('ip', 'ip_net')->all());
         $quiet = array_flip((new RiskService())->quietUserIds());
-        return response(['data' => $page->map(function ($row) use ($users, $summaries, $servers, $rows, $probes, $quiet) {
+        return response(['data' => $page->map(function ($row) use ($users, $summaries, $servers, $rows, $probes, $near, $quiet) {
             $user = $users->get($row->user_id);
             $isolated = $user ? (int)$user->risk_status === RiskService::STATUS_RISK : false;
             $summary = $summaries[$row->user_id] ?? [];
@@ -553,6 +556,9 @@ class RiskController extends Controller
                 'reports' => (int)$row->reports,
                 'servers' => array_values(array_intersect_key($servers, array_flip($summary['nodes'] ?? []))),
                 'probe_hits' => $isolated ? null : $nets->filter(function ($net) use ($probes) { return isset($probes[$net]); })->count(),
+                'probe_near_hits' => $isolated ? null : $nets->filter(function ($net) use ($probes, $near) {
+                    return !isset($probes[$net]) && isset($near[$net]);
+                })->count(),
             ] + array_diff_key($summary, ['nodes' => 1]);
         })->values(), 'total' => $total]);
     }
@@ -560,7 +566,8 @@ class RiskController extends Controller
     /**
      * The connection log, the latest first, like accessFetch(): a date range (see connRange()) and the other filters
      * (see connFilter()). Each row says whether a list covers its source now, whether it is shared, which users
-     * isolated now connected from it too (a probing IP), and whether its user is quiet. Pages of at most 100 rows.
+     * isolated now connected from it too (a probing IP) or, if none, from its network (probe_near, see
+     * RiskConnService::nearProbes()), and whether its user is quiet. Pages of at most 100 rows.
      */
     public function connFetch(Request $request)
     {
@@ -577,15 +584,20 @@ class RiskController extends Controller
             $nets = $rows->pluck('ip_net')->filter()->unique()->values()->all();
             $shared = $conn->sharedNets($nets);
             $probes = $conn->probeUsers($nets);
-            $emails = User::whereIn('id', array_merge([], ...array_map('array_keys', array_values($probes))))->pluck('email', 'id');
+            $near = $conn->nearProbes($rows->filter(function (RiskConn $row) use ($users) {
+                $user = $users->get($row->user_id);
+                return $row->ip_net !== '' && !($user && (int)$user->risk_status === RiskService::STATUS_RISK);
+            })->pluck('ip', 'ip_net')->all());
+            $emails = User::whereIn('id', array_merge([], ...array_map('array_keys', array_values($probes)), ...array_column($near, 'users')))->pluck('email', 'id');
             $service = new RiskService();
             $quiet = array_flip($service->quietUserIds());
             $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->get();
             $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
-            return $rows->map(function (RiskConn $row) use ($users, $info, $isNode, $servers, $shared, $probes, $emails, $service, $quiet, $allowlist, $ipRules) {
+            return $rows->map(function (RiskConn $row) use ($users, $info, $isNode, $servers, $shared, $probes, $near, $emails, $service, $quiet, $allowlist, $ipRules) {
                 $user = $users->get($row->user_id);
                 $source = $row->ip_net !== '';
                 $owners = array_diff(array_keys($probes[$row->ip_net] ?? []), [(int)$row->user_id]);
+                $nearby = !$owners && isset($near[$row->ip_net]) ? $near[$row->ip_net] : null;
                 return [
                     // The primary key, for the table's row key
                     'key' => implode('|', [$row->record_at, $row->user_id, $row->ip_net]),
@@ -611,6 +623,12 @@ class RiskController extends Controller
                     'shared' => (int)($shared[$row->ip_net] ?? 0),
                     // The other users isolated now who connected from it: a probing IP
                     'probe_users' => array_map(function ($id) use ($emails) { return ['id' => $id, 'email' => $emails[$id] ?? null]; }, array_values($owners)),
+                    // Not one, but in the network (an IPv4 /24, an IPv6 /48) of one: the latest probing IP there, the
+                    // network and its isolated users; counted by 命中测活 IP with conn_link_loose
+                    'probe_near' => $nearby ? [
+                        'ip_net' => $nearby['probe'], 'net' => $nearby['net'], 'last_seen_at' => $nearby['last_seen_at'],
+                        'users' => array_map(function ($id) use ($emails) { return ['id' => $id, 'email' => $emails[$id] ?? null]; }, $nearby['users']),
+                    ] : null,
                     // The row that takes a user's sources over the daily limit
                     'overflow' => !$source,
                     'servers' => array_values(array_intersect_key($servers, array_flip(array_filter(explode(',', (string)$row->servers))))),
