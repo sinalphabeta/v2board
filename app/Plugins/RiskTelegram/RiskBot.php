@@ -136,7 +136,7 @@ class RiskBot
     {
         $result = $operator->service()->addIndicators($type, $values);
         $notes = $type === 'email' && $result['added'] ? $this->usersLine('🔒 已隔离', $result['added'], true) : [];
-        if (in_array($type, RiskService::ALLOW_TYPES, true) && $result['invalid']) $notes[] = $this->view->escape(RiskService::ALLOW_IP_FORMAT);
+        if (RiskService::formatHint($type) !== null && $result['invalid']) $notes[] = $this->view->escape(RiskService::formatHint($type));
         $this->reply($message, $this->view->result([
             '✅ 新增' => $result['added'], '⚠️ 已存在' => $result['existing'], '❌ 格式无效' => $result['invalid'],
             '🟢 在 IP 白名单或节点 IP 里，没有加入' => $result['allowlisted'], '🌐 已从 IP 名单移除' => $result['disabled'],

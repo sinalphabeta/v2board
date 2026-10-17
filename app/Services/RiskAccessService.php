@@ -14,7 +14,8 @@ use Illuminate\Support\Facades\DB;
  * day's 0:00), user, type, result, IP and user agent, kept for access_log_days days; also subscriptions with a link that
  * a reset replaced (old_link, logged for the user it belonged to). Also the daily subscription limit, and the exit IPs
  * of the nodes, which the link checks leave out: the node IP list (node_ip, kept by hand) and the IPs the node APIs
- * were called from lately (remembered here, never complete: a node may go out through another server).
+ * were called from lately (remembered here, never complete: a node may go out through another server). A node IP may
+ * also be a domain name, for a relay whose IP changes (DDNS): it stands for what it resolved to lately (hostRanges()).
  *
  * An IPv6 address is merged by its /64 (ip_net), since clients rotate their addresses; ip keeps the last one seen.
  * Rows are written one statement each, outside any transaction; a write never fails the request: errors are reported at
@@ -33,10 +34,19 @@ class RiskAccessService
     // a client may send a new user agent each time
     public const OVERFLOW_AFTER = 1000;
     public const NODE_DAYS = 7;
+    // How long a node IP given as a domain name still stands for an IP it no longer resolves to: clients may still
+    // connect to the relay's old address
+    public const NODE_HOST_SECONDS = 86400;
     // How long a subscription token replaced by a reset is still known (old_link)
     public const OLD_LINK_DAYS = 30;
     private const NODES_KEY = 'risk:node-ips';
+    private const NODE_HOSTS_KEY = 'risk:node-hosts';
     private const ERROR_KEY = 'risk:access:last-error';
+    // How long a process keeps the node IPs compiled for the nodes' reports (cachedNodeMatcher()): every node reports
+    // every minute, and webman and Horizon run for days
+    private const NODE_FILTER_SECONDS = 60;
+    // [expires at, compiled node IPs]
+    private static $nodeFilter;
     private $risk;
 
     public function __construct(?RiskService $risk = null)
@@ -257,7 +267,7 @@ class RiskAccessService
      */
     public function nodeMatcher(): callable
     {
-        $listed = RiskIndicator::where('type', 'node_ip')->where('enabled', 1)->pluck('value')->all();
+        $listed = $this->nodeRanges();
         $seen = $this->nodeNets();
         return function (string $ip, ?string $net = null) use ($listed, $seen): bool {
             if ($net === null) $net = $this->ipNet($ip);
@@ -275,7 +285,7 @@ class RiskAccessService
      */
     public function autoNodes(): array
     {
-        $listed = RiskIndicator::where('type', 'node_ip')->where('enabled', 1)->pluck('value')->all();
+        $listed = $this->nodeRanges();
         $nodes = [];
         foreach ($this->nodeNets() as $net => $seen) {
             foreach ($listed as $entry) if ($this->risk()->ipRangeWithin((string)$net, (string)$entry)) continue 2;
@@ -283,6 +293,198 @@ class RiskAccessService
         }
         arsort($nodes);
         return $nodes;
+    }
+
+    /**
+     * A node's report of the devices online ({uid: [ip, …]}, UniProxyController::alive()) without the node IPs: a node
+     * behind a relay sees the relay's IP, which is not a device of the user (a user who tests all the nodes' delays
+     * would count one or two more).
+     */
+    public function withoutNodeIps(array $data): array
+    {
+        try {
+            $isNode = $this->cachedNodeMatcher();
+        } catch (\Throwable $e) {
+            return $data;
+        }
+        foreach ($data as $uid => $ips) {
+            if (!is_array($ips)) continue;
+            $kept = [];
+            // Older nodes send ip_nodeid
+            foreach ($ips as $ip) if (!is_string($ip) || !$isNode(explode('_', $ip)[0])) $kept[] = $ip;
+            $data[$uid] = $kept;
+        }
+        return $data;
+    }
+
+    /**
+     * Tells a node IP like nodeMatcher(), for many IPs: fn(string $ip): bool from the node IPs compiled into lookups,
+     * once a minute per process.
+     */
+    public function cachedNodeMatcher(): callable
+    {
+        $now = time();
+        if (!self::$nodeFilter || self::$nodeFilter[0] <= $now) self::$nodeFilter = [$now + self::NODE_FILTER_SECONDS, $this->compileNodes()];
+        $compiled = self::$nodeFilter[1];
+        return function (string $ip) use ($compiled): bool {
+            return self::inCompiled($compiled, self::plainIp($ip));
+        };
+    }
+
+    /**
+     * Compile the node IPs again on the next cachedNodeMatcher() in this process, as after a list changed.
+     */
+    public static function forgetNodeFilter(): void
+    {
+        self::$nodeFilter = null;
+    }
+
+    /**
+     * The node IPs (nodeRanges()) and the IPs the node APIs were called from (nodeNets()) in binary, as
+     * [addresses => true, IPv6 /64s (their first 8 bytes) => true, [[network, prefix length], …] for other ranges].
+     */
+    private function compileNodes(): array
+    {
+        $exact = $nets = $ranges = [];
+        foreach (array_merge($this->nodeRanges(), array_keys($this->nodeNets())) as $range) {
+            [$address, $bits] = array_pad(explode('/', (string)$range, 2), 2, null);
+            if (!filter_var($address, FILTER_VALIDATE_IP)) continue;
+            $binary = inet_pton($address);
+            $max = strlen($binary) * 8;
+            $bits = $bits === null ? $max : max(0, min($max, (int)$bits));
+            if ($bits === $max) $exact[$binary] = true;
+            elseif ($max === 128 && $bits === 64) $nets[substr($binary, 0, 8)] = true;
+            else $ranges[] = [$binary, $bits];
+        }
+        return [$exact, $nets, $ranges];
+    }
+
+    private static function inCompiled(array $compiled, string $ip): bool
+    {
+        if (!filter_var($ip, FILTER_VALIDATE_IP)) return false;
+        [$exact, $nets, $ranges] = $compiled;
+        $binary = inet_pton($ip);
+        if (isset($exact[$binary]) || (strlen($binary) === 16 && isset($nets[substr($binary, 0, 8)]))) return true;
+        foreach ($ranges as [$network, $bits]) {
+            if (strlen($network) !== strlen($binary)) continue;
+            $bytes = intdiv($bits, 8);
+            if ($bytes && substr($binary, 0, $bytes) !== substr($network, 0, $bytes)) continue;
+            $rest = $bits % 8;
+            if ($rest && ((ord($binary[$bytes]) ^ ord($network[$bytes])) & (0xff << (8 - $rest)) & 0xff)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The enabled node IPs as IPs and CIDRs: a domain name as what it resolved to lately (hostRanges()).
+     */
+    public function nodeRanges(): array
+    {
+        $hosts = null;
+        $ranges = [];
+        foreach (RiskIndicator::where('type', 'node_ip')->where('enabled', 1)->pluck('value') as $value) {
+            $value = trim((string)$value);
+            if (!self::isHost($value)) {
+                $ranges[] = $value;
+                continue;
+            }
+            if ($hosts === null) $hosts = $this->nodeHosts();
+            foreach ($this->hostRanges($value, $hosts) as $range) $ranges[] = $range;
+        }
+        return array_values(array_unique($ranges));
+    }
+
+    /**
+     * Whether a node IP entry is a domain name (a relay with DDNS) rather than an IP or CIDR.
+     */
+    public static function isHost(string $value): bool
+    {
+        return strpos($value, '/') === false && !filter_var($value, FILTER_VALIDATE_IP)
+            && filter_var($value, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) !== false
+            // A name with a dot and a top-level label that is not a number, unlike 1.2.3
+            && (bool)preg_match('/\.[a-z][a-z0-9-]*$/i', $value);
+    }
+
+    /**
+     * risk:node-resolve, every minute: look up the node IPs given as domain names (their A and AAAA records) and
+     * remember the IPs they resolve to. An IP is kept for NODE_HOST_SECONDS after it was last seen; a failed lookup
+     * keeps them all as they were. $resolve(string $host): array of IPs, empty or null when the lookup failed (the
+     * tests pass their own). Returns [host => the IPs found, or null when the lookup failed].
+     */
+    public function resolveNodeHosts(?callable $resolve = null): array
+    {
+        $resolve = $resolve ?? function (string $host): ?array {
+            $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+            if (!is_array($records)) return null;
+            $ips = [];
+            foreach ($records as $record) $ips[] = $record['ip'] ?? $record['ipv6'] ?? null;
+            return array_values(array_filter($ips));
+        };
+        $known = $this->nodeHosts();
+        $now = time();
+        $hosts = $found = [];
+        foreach (RiskIndicator::where('type', 'node_ip')->where('enabled', 1)->pluck('value') as $host) {
+            $host = (string)$host;
+            if (!self::isHost($host)) continue;
+            $entry = ($known[$host] ?? []) + ['ips' => [], 'resolved_at' => null, 'failed_at' => null];
+            try {
+                $ips = $resolve($host);
+            } catch (\Throwable $e) {
+                $ips = null;
+            }
+            $ips = array_values(array_unique(array_filter(array_map(function ($ip) {
+                $ip = self::plainIp(trim((string)$ip));
+                return filter_var($ip, FILTER_VALIDATE_IP) ? $ip : null;
+            }, is_array($ips) ? $ips : []))));
+            if ($ips) {
+                foreach ($ips as $ip) $entry['ips'][$ip] = $now;
+                $entry['ips'] = array_filter($entry['ips'], function ($seen) use ($now) { return $seen > $now - self::NODE_HOST_SECONDS; });
+                $entry['resolved_at'] = $now;
+                $entry['failed_at'] = null;
+            } else {
+                $entry['failed_at'] = $now;
+            }
+            $hosts[$host] = $entry;
+            $found[$host] = $ips ?: null;
+        }
+        Cache::forever(self::NODE_HOSTS_KEY, $hosts);
+        return $found;
+    }
+
+    /**
+     * The node IP domain names' lookups: [host => ['ips' => [ip => last seen], 'resolved_at' => time or null,
+     * 'failed_at' => the last failed lookup's time, null after one that worked]].
+     */
+    public function nodeHosts(): array
+    {
+        try {
+            $hosts = Cache::get(self::NODE_HOSTS_KEY);
+        } catch (\Throwable $e) {
+            return [];
+        }
+        return is_array($hosts) ? $hosts : [];
+    }
+
+    /**
+     * What a node IP given as a domain name stands for: the IPs it resolved to lately (see resolveNodeHosts()), an IPv6
+     * address as its /64, as a relay's address may change within it. $hosts: nodeHosts(), if read already.
+     */
+    public function hostRanges(string $host, ?array $hosts = null): array
+    {
+        $hosts = $hosts ?? $this->nodeHosts();
+        $ranges = [];
+        foreach (array_keys($hosts[$host]['ips'] ?? []) as $ip) $ranges[] = $this->ipNet((string)$ip);
+        return array_values(array_unique($ranges));
+    }
+
+    /**
+     * An IPv4 address that came as IPv4-mapped IPv6 (::ffff:1.2.3.4) as IPv4, any other value as it is.
+     */
+    public static function plainIp(string $ip): string
+    {
+        if (stripos($ip, '::ffff:') === 0 && filter_var(substr($ip, 7), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return substr($ip, 7);
+        return $ip;
     }
 
     /**
@@ -421,13 +623,9 @@ class RiskAccessService
         return $total;
     }
 
-    /**
-     * An IPv4 address that came as IPv4-mapped IPv6 (::ffff:1.2.3.4), as IPv4.
-     */
     private function ip(string $ip): string
     {
-        if (stripos($ip, '::ffff:') === 0 && filter_var(substr($ip, 7), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) return substr($ip, 7);
-        return $ip;
+        return self::plainIp($ip);
     }
 
     private function failed(\Throwable $e): void

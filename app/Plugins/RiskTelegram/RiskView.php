@@ -54,7 +54,7 @@ class RiskView
     // What a list says about itself, under its title
     private const LIST_ABOUT = [
         'allow_ip' => '这些 IP 命中 IP、ASN 名单不告警，UA、邮箱名单照常',
-        'node_ip' => '节点的出口 IP：和 IP 白名单一样，命中 IP、ASN 名单不告警，关联检测和日报的多地区也跳过；UA、邮箱名单照常',
+        'node_ip' => '节点的出口 IP、中转机的 IP 或域名：和 IP 白名单一样，命中 IP、ASN 名单不告警，关联检测和日报的多地区也跳过；UA、邮箱名单照常。域名每分钟解析一次',
     ];
     // How many of the node IPs found by the node APIs the node IP list shows
     private const AUTO_NODES_SHOWN = 10;
@@ -116,8 +116,9 @@ class RiskView
         if (!isset(self::TYPES[$type])) $type = 'email';
         $query = RiskIndicator::where('type', $type)->where('enabled', 1)->orderBy('value');
         [$indicators, $page, $pages, $total] = $this->paginate($query, $page, $type === 'ua' ? 10 : 20);
-        $lines = $indicators->map(function (RiskIndicator $indicator) {
-            return '• ' . $this->code($indicator->value) .
+        $hosts = $type === 'node_ip' ? (new RiskAccessService())->nodeHosts() : [];
+        $lines = $indicators->map(function (RiskIndicator $indicator) use ($hosts) {
+            return '• ' . $this->code($indicator->value) . $this->hostLine($hosts, (string)$indicator->value) .
                 ($indicator->note ? ' — ' . $this->escape($this->shorten($indicator->note, 40)) : '');
         })->all();
         $about = isset(self::LIST_ABOUT[$type]) ? "\n" . $this->escape(self::LIST_ABOUT[$type]) : '';
@@ -138,6 +139,21 @@ class RiskView
             array_unshift($keyboard, [$this->button('➕ 全部加入节点 IP', 'r:na')]);
         }
         return $this->view($text, $keyboard);
+    }
+
+    /**
+     * What a node IP given as a domain name resolves to, after it in the list: → 1.2.3.4、… , or that it is not
+     * resolved yet or the last lookup failed. Empty for an IP or CIDR.
+     */
+    private function hostLine(array $hosts, string $value): string
+    {
+        if (!RiskAccessService::isHost($value)) return '';
+        $host = $hosts[$value] ?? [];
+        $ips = $host['ips'] ?? [];
+        arsort($ips);
+        $text = $ips ? '→ ' . implode('、', array_slice(array_keys($ips), 0, 4)) . (count($ips) > 4 ? ' 等 ' . count($ips) . ' 个' : '') : '还没解析到 IP';
+        if (!empty($host['failed_at'])) $text .= '（' . $this->time($host['failed_at']) . ' 解析失败）';
+        return ' ' . $this->escape($text);
     }
 
     public function audit(int $page): array
@@ -212,7 +228,7 @@ class RiskView
                 '/addua、/delua、/listua  UA 关键字',
                 '/addasn、/delasn、/listasn  AS 号',
                 '/addallow、/delallow、/listallow  IP 白名单：命中 IP、ASN 名单不告警',
-                '/addnode、/delnode、/listnode  节点 IP：节点的出口，和白名单一样',
+                '/addnode、/delnode、/listnode  节点 IP：节点的出口、中转机的 IP 或域名，和白名单一样',
                 '/list  邮箱名单',
                 '/edit 值或ID 备注  修改备注',
             ],

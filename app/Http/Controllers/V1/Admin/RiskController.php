@@ -148,6 +148,8 @@ class RiskController extends Controller
 
     /**
      * IP indicators and the allowlists also say where their IPs are (a CIDR by its network address), see ipInfoFields().
+     * A node IP given as a domain name has `host`: the IPs it resolves to (the latest first), when it was last resolved
+     * and when a lookup last failed; where it is is where its latest IP is.
      */
     public function indicatorFetch(Request $request)
     {
@@ -166,15 +168,31 @@ class RiskController extends Controller
             });
         }
         return $this->paged($request, $query->orderByDesc('id'), function ($indicators) {
+            $known = (new RiskAccessService())->nodeHosts();
+            $hosts = [];
+            foreach ($indicators as $indicator) {
+                if ($indicator->type !== 'node_ip' || !RiskAccessService::isHost((string)$indicator->value)) continue;
+                $host = $known[$indicator->value] ?? [];
+                $ips = $host['ips'] ?? [];
+                arsort($ips);
+                $hosts[$indicator->id] = [
+                    'ips' => array_map('strval', array_keys($ips)),
+                    'resolved_at' => $host['resolved_at'] ?? null,
+                    'failed_at' => $host['failed_at'] ?? null,
+                ];
+            }
             $ips = $indicators->filter(function (RiskIndicator $indicator) {
                 return $indicator->type === 'ip' || in_array($indicator->type, RiskService::ALLOW_TYPES, true);
-            })->mapWithKeys(function (RiskIndicator $indicator) {
+            })->mapWithKeys(function (RiskIndicator $indicator) use ($hosts) {
+                if (isset($hosts[$indicator->id])) return [$indicator->id => $hosts[$indicator->id]['ips'][0] ?? null];
                 return [$indicator->id => explode('/', (string)$indicator->value)[0]];
-            });
+            })->filter();
             $info = $ips->isEmpty() ? [] : (new IpInfoService())->lookupMany($ips->values()->all());
-            return $indicators->map(function (RiskIndicator $indicator) use ($ips, $info) {
+            return $indicators->map(function (RiskIndicator $indicator) use ($ips, $info, $hosts) {
                 $row = $indicator->toArray();
-                return isset($ips[$indicator->id]) ? $row + $this->ipInfoFields($info[$ips[$indicator->id]] ?? null) : $row;
+                if (isset($hosts[$indicator->id])) $row['host'] = $hosts[$indicator->id];
+                if ($indicator->type !== 'ip' && !in_array($indicator->type, RiskService::ALLOW_TYPES, true)) return $row;
+                return $row + $this->ipInfoFields(isset($ips[$indicator->id]) ? ($info[$ips[$indicator->id]] ?? null) : null);
             })->values();
         });
     }
@@ -192,7 +210,7 @@ class RiskController extends Controller
             $indicator = RiskIndicator::find((int)$request->input('id'));
             if (!$indicator) abort(500, '名单不存在');
             $value = $service->normalizeIndicatorValue($indicator->type, $request->input('value', $indicator->value));
-            if ($value === null) abort(500, in_array($indicator->type, RiskService::ALLOW_TYPES, true) ? RiskService::ALLOW_IP_FORMAT : '值的格式有误');
+            if ($value === null) abort(500, RiskService::formatHint($indicator->type) ?? '值的格式有误');
             if (RiskIndicator::where('type', $indicator->type)->where('value', $value)->where('id', '!=', $indicator->id)->exists()) {
                 abort(500, '名单里已经有这个值');
             }
@@ -316,7 +334,7 @@ class RiskController extends Controller
             $dropped = RiskAudit::where('action', 'drop')->whereIn('indicator_id', $ruleIds->diff($rules->keys())->values())
                 ->get(['indicator_id', 'type', 'value'])->keyBy('indicator_id');
             $service = new RiskService();
-            $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->pluck('value');
+            $allowlist = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->get();
             $ipRules = RiskIndicator::where('type', 'ip')->where('enabled', 1)->orderBy('id')->pluck('value');
             $uaRules = RiskIndicator::where('type', 'ua')->where('enabled', 1)->pluck('value');
             $isNode = $service->access()->nodeMatcher();
@@ -332,8 +350,8 @@ class RiskController extends Controller
                     'event_type' => $event->event_type,
                     'ip' => $event->ip,
                     // Whether an enabled allowlist entry (IP 白名单 or 节点 IP) covers the IP now (the event may be from before)
-                    'ip_allowed' => $allowlist->contains(function ($entry) use ($service, $event) {
-                        return $service->ipMatches((string)$event->ip, $entry);
+                    'ip_allowed' => $allowlist->contains(function (RiskIndicator $entry) use ($service, $event) {
+                        return $service->entryMatches((string)$event->ip, $entry);
                     }),
                     // A node's exit IP: in the node IP list, or one the node APIs were called from lately (not ip_allowed
                     // then, until it is added to the list)

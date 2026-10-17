@@ -153,6 +153,8 @@ class UniProxyController extends Controller
             ], 400);
         }
         $updateAt = time();
+        // fork: the node IPs (a relay's address, seen by a node behind it) are not the users' devices
+        $data = (new RiskAccessService())->withoutNodeIps($data);
 
         $cacheKeys = [];
         $keyMap = [];

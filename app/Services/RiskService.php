@@ -51,7 +51,9 @@ class RiskService
     public const ALLOW_TYPES = ['allow_ip', 'node_ip'];
     // The shortest allowlist prefix by address length: at most a /16 (IPv4) or /48 (IPv6) is let through at once
     private const ALLOW_MIN_PREFIX = [32 => 16, 128 => 48];
-    public const ALLOW_IP_FORMAT = 'IP 白名单和节点 IP 只接受 IP，或不大于 /16（IPv6 /48）的网段，也不能是 0.0.0.0 或 ::';
+    public const ALLOW_IP_FORMAT = 'IP 白名单只接受 IP，或不大于 /16（IPv6 /48）的网段，也不能是 0.0.0.0 或 ::';
+    // A node IP may also be a relay's domain name (DDNS), see RiskAccessService::resolveNodeHosts()
+    public const NODE_IP_FORMAT = '节点 IP 只接受 IP、不大于 /16（IPv6 /48）的网段或域名，也不能是 0.0.0.0 或 ::';
     private const INDICATORS_CACHE_KEY = 'risk:enabled-indicators';
     private $ipInfoService;
     private $access;
@@ -119,8 +121,51 @@ class RiskService
         if ($type === 'asn') $value = (string)$this->normalizeAsn($value);
         if ($value === '' || mb_strlen($value, 'UTF-8') > 255) return null;
         if ($type === 'email') return filter_var($value, FILTER_VALIDATE_EMAIL) ? $value : null;
-        if ($type === 'ip' || in_array($type, self::ALLOW_TYPES, true)) return $this->normalizeIpRange($value, $type !== 'ip');
+        if ($type === 'ip' || in_array($type, self::ALLOW_TYPES, true)) {
+            $range = $this->normalizeIpRange($value, $type !== 'ip');
+            if ($range === null && $type === 'node_ip') return $this->normalizeHost($value);
+            return $range;
+        }
         return in_array($type, ['ua', 'asn'], true) ? $value : null;
+    }
+
+    /**
+     * Why a value was refused for an allowlist (IP 白名单, 节点 IP), or null for the other types.
+     */
+    public static function formatHint(string $type): ?string
+    {
+        if ($type === 'node_ip') return self::NODE_IP_FORMAT;
+        return $type === 'allow_ip' ? self::ALLOW_IP_FORMAT : null;
+    }
+
+    /**
+     * A domain name for a node IP in lower case without the final dot (Relay.Example.com. → relay.example.com), or null
+     * if it is not one.
+     */
+    private function normalizeHost(string $value): ?string
+    {
+        $host = rtrim(strtolower(trim($value)), '.');
+        return strlen($host) <= 253 && RiskAccessService::isHost($host) ? $host : null;
+    }
+
+    /**
+     * The IPs and CIDRs an allowlist entry stands for: its value, or for a node IP given as a domain name what it
+     * resolved to lately (RiskAccessService::hostRanges()).
+     */
+    public function entryRanges(RiskIndicator $entry): array
+    {
+        $value = trim((string)$entry->value);
+        if ($entry->type !== 'node_ip' || !RiskAccessService::isHost($value)) return [$value];
+        return $this->access()->hostRanges($value);
+    }
+
+    /**
+     * Whether an allowlist entry covers the IP (see entryRanges()).
+     */
+    public function entryMatches(string $ip, RiskIndicator $entry): bool
+    {
+        foreach ($this->entryRanges($entry) as $range) if ($this->ipMatches($ip, $range)) return true;
+        return false;
     }
 
     /**
@@ -217,7 +262,8 @@ class RiskService
     {
         return RiskIndicator::whereIn('type', $types)->where('enabled', 1)->orderBy('id')->get()
             ->first(function (RiskIndicator $entry) use ($ipOrCidr) {
-                return $this->ipRangeWithin($ipOrCidr, $entry->value);
+                foreach ($this->entryRanges($entry) as $range) if ($this->ipRangeWithin($ipOrCidr, $range)) return true;
+                return false;
             });
     }
 
@@ -355,7 +401,7 @@ class RiskService
         // An allowlisted IP skips the IP and ASN rules, so its ASN is not looked up either
         $allowed = false;
         foreach ($indicators as $indicator) {
-            if (in_array($indicator->type, self::ALLOW_TYPES, true) && $this->ipMatches($ip, trim((string)$indicator->value))) {
+            if (in_array($indicator->type, self::ALLOW_TYPES, true) && $this->entryMatches($ip, $indicator)) {
                 $allowed = true;
                 break;
             }
@@ -812,6 +858,7 @@ class RiskService
         if ((string)$indicator->note !== '') $was['note'] = [$indicator->note, null];
         if (!$indicator->delete()) return false;
         Cache::forget(self::INDICATORS_CACHE_KEY);
+        RiskAccessService::forgetNodeFilter();
         $this->audit('drop', $indicator, $was);
         $users->each(function (User $user) { $this->reconcileEmailRisk($user); });
         return true;
@@ -859,6 +906,8 @@ class RiskService
         if (!$changes) return true;
         if (!$indicator->save()) return false;
         Cache::forget(self::INDICATORS_CACHE_KEY);
+        // Other processes compile the node IPs again within a minute
+        RiskAccessService::forgetNodeFilter();
         if ($reason !== null) $changes['reason'] = $reason;
         $this->audit($action, $indicator, $changes);
         return true;

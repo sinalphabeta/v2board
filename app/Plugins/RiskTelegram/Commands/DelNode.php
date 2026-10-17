@@ -9,5 +9,5 @@ class DelNode extends IndicatorCommand
     public $sort = 107;
     protected $type = 'node_ip';
     protected $action = 'del';
-    protected $usage = 'IP或CIDR…';
+    protected $usage = 'IP、CIDR或域名…';
 }

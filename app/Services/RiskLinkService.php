@@ -286,11 +286,14 @@ class RiskLinkService
 
     /**
      * Whether an IP (and its ip_net) is left out of the checks: private or reserved, in the IP allowlist or the node
-     * IPs, or one the node APIs were called from lately.
+     * IPs (a domain name as what it resolved to lately), or one the node APIs were called from lately.
      */
-    private function excluder(): callable
+    public function excluder(): callable
     {
-        $allow = RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->pluck('value')->all();
+        $allow = [];
+        foreach (RiskIndicator::whereIn('type', RiskService::ALLOW_TYPES)->where('enabled', 1)->get() as $entry) {
+            foreach ($this->risk->entryRanges($entry) as $range) $allow[] = $range;
+        }
         $nodes = $this->access->nodeNets();
         return function (string $ip, string $net) use ($allow, $nodes): bool {
             if (!$this->access->isPublic($ip) || isset($nodes[$net])) return true;
