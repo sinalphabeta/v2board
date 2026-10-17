@@ -34,14 +34,14 @@ class RiskService
     public const FINDING_TYPES = [
         'sub_limit' => '订阅超限', 'ip_users' => '同 IP 多用户', 'register_link' => '注册关联', 'sub_burst' => '订阅过频',
         // From the connection log (RiskConnService)
-        'conn_ips' => '连接 IP 过多', 'conn_link' => '命中测活 IP',
+        'conn_ips' => '连接 IP 过多', 'conn_link' => '命中测活 IP', 'conn_places' => '连接地区过多',
     ];
     /**
      * The findings that are recorded but not alerted for a quiet user (免告警, e.g. one sharing a plan with friends):
-     * many sources, many subscriptions. 命中测活 IP is only kept quiet when it is near a probing IP, not on one
-     * (RiskConnService::scanProbes()).
+     * many sources and places, many subscriptions. 命中测活 IP is only kept quiet when it is near a probing IP, not on
+     * one (RiskConnService::scanProbes()).
      */
-    public const QUIET_TYPES = ['sub_limit', 'sub_burst', 'conn_ips'];
+    public const QUIET_TYPES = ['sub_limit', 'sub_burst', 'conn_ips', 'conn_places'];
     /**
      * Indicator types. allow_ip and node_ip are allowlists (ALLOW_TYPES). email, ip, ua and asn are risk rules
      * (RULE_TYPES): a match is recorded and alerted, and an email match also isolates the user. quiet holds the emails

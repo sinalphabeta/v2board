@@ -138,6 +138,7 @@ class RiskController extends Controller
             'conn_log_days' => [7, 365, '连接记录保留天数应该是 7 到 365 之间的整数'],
             'conn_ip_limit' => [0, 200, '1 小时连接 IP 数告警应该是 0（不检测）或 5 到 200 之间的整数'],
             'conn_link_ips' => [0, 20, '命中测活 IP 告警应该是 0（不检测）或 1 到 20 之间的整数'],
+            'conn_place_limit' => [0, 50, '7 天连接地区数告警应该是 0（不检测）或 3 到 50 之间的整数'],
         ];
         foreach ($ranges as $name => [$min, $max, $error]) {
             if (!$request->has($name)) continue;
@@ -146,6 +147,8 @@ class RiskController extends Controller
             // A handful of updates in 10 minutes is normal (a client started, a few devices), and a few IPs in an hour
             // (home, office, a phone moving)
             if (in_array($name, ['sub_burst_limit', 'conn_ip_limit'], true) && (int)$value > 0 && (int)$value < 5) abort(500, $error);
+            // One or two places in a week is anyone (home and work, a trip)
+            if ($name === 'conn_place_limit' && (int)$value > 0 && (int)$value < 3) abort(500, $error);
             $values[$name] = (int)$value;
         }
         $service = $this->riskService($request);

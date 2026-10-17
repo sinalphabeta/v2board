@@ -42,6 +42,13 @@ class RiskConnService
     // IPs yet, a carrier's NAT, an office): the checks leave it out
     public const SHARED_USERS = 5;
     public const SHARED_DAYS = 7;
+    // 连接地区过多: a user's places in this many days (today counts as one), alerted once in as many days; checked once an
+    // hour, as a slow probe is no hurry and looking up where a week of sources are takes a while
+    public const PLACES_DAYS = 7;
+    private const PLACES_SCAN_KEY = 'risk:conn:places-scanned';
+    private const PLACES_SCAN_SECONDS = 3300;
+    // The users checked for their places at a time (their week of sources looked up together)
+    private const PLACES_BATCH = 200;
     // Filtering by place looks up where this many sources are at most (500 take about 25 ms): it is not stored
     public const PLACE_LOOKUPS = 10000;
     private const BUFFER_KEY = 'risk:conn:buffer';
@@ -354,15 +361,15 @@ class RiskConnService
     }
 
     /**
-     * risk:scan, every 10 minutes: alert users with many sources in the last hour (conn_ips) and users connecting from
-     * or near the probing IPs (conn_link); each check fails alone. Only alerted, never acted on. Returns how many were
-     * alerted.
+     * risk:scan, every 10 minutes: alert users with many sources in the last hour (conn_ips), users connecting from or
+     * near the probing IPs (conn_link) and, once an hour, users with sources in many places in 7 days (conn_places);
+     * each check fails alone. Only alerted, never acted on. Returns how many were alerted.
      */
     public function scan(): int
     {
         if (!$this->enabled()) return 0;
         $alerted = 0;
-        foreach (['scanSources', 'scanProbes'] as $check) {
+        foreach (['scanSources', 'scanProbes', 'scanPlaces'] as $check) {
             try {
                 $alerted += $this->{$check}();
             } catch (\Throwable $e) {
@@ -409,7 +416,7 @@ class RiskConnService
             $detail = "1 小时内 {$summary['sources']} 个 IP（{$summary['segments']} 个网段，{$summary['brief']} 个只出现了一两分钟）· "
                 . "{$summary['provinces']} 个地区、{$networks} 个运营商 · 节点 " . (implode('、', array_slice($names, 0, 3)) ?: '-') . " · {$examples}";
             $user = $users->get($userId);
-            if ($this->recordOnce($user, 'conn_ips', (string)$latest->first()->ip, $detail, $this->risk()->isQuiet($user))) $alerted++;
+            if ($this->recordOnce($user, 'conn_ips', (string)$latest->first()->ip, $detail, 86400, $this->risk()->isQuiet($user))) $alerted++;
         }
         return $alerted;
     }
@@ -467,36 +474,93 @@ class RiskConnService
             $user = $users->get($userId);
             $first = $hits->first() ?? $nearHits->first();
             $quiet = !$hits->count() && $this->risk()->isQuiet($user);
-            if ($this->recordOnce($user, 'conn_link', (string)$first->ip, $detail, $quiet)) $alerted++;
+            if ($this->recordOnce($user, 'conn_link', (string)$first->ip, $detail, 86400, $quiet)) $alerted++;
         }
         return $alerted;
     }
 
     /**
-     * Record a finding about the user, alerted once in 24 hours (not by the date: a check before and after midnight
-     * would alert twice); later scans update the same event, without alerting. A quiet user's ($quiet) is recorded
-     * silent: it alerts once a later scan finds them no longer quiet (or, for 命中测活 IP, on a probing IP), within the
-     * same 24 hours. Returns whether it alerted.
+     * 连接地区过多, once an hour: a user (not isolated, not an admin) whose sources of the last PLACES_DAYS days are in
+     * conn_place_limit or more places (provinces, countries overseas, from where their IPs are), left-out and shared
+     * sources aside: a probe that tests now and then, from somewhere else in the country each time. Alerted once in
+     * PLACES_DAYS days, and not when 连接 IP 过多 alerted about the user in the last 24 hours (only recorded then).
      */
-    private function recordOnce(User $user, string $type, string $ip, string $detail, bool $quiet): bool
+    private function scanPlaces(): int
+    {
+        $limit = (int)RiskSettings::get('conn_place_limit');
+        if ($limit <= 0 || !Cache::add(self::PLACES_SCAN_KEY, 1, self::PLACES_SCAN_SECONDS)) return 0;
+        $since = $this->access()->day(time()) - (self::PLACES_DAYS - 1) * 86400;
+        $recent = function () use ($since) { return RiskConn::where('record_at', '>=', $since)->where('ip_net', '!=', ''); };
+        // Only users with that many sources can have them in that many places
+        $ids = $recent()->whereNotIn('user_id', User::where('risk_status', RiskService::STATUS_RISK)->orWhere('is_admin', 1)->select('id'))
+            ->groupBy('user_id')->havingRaw('COUNT(DISTINCT ip_net) >= ?', [$limit])->pluck('user_id')->all();
+        $exclude = $this->risk()->links()->excluder();
+        $alerted = 0;
+        foreach (array_chunk($ids, self::PLACES_BATCH) as $batch) {
+            $rows = $recent()->whereIn('user_id', $batch)->get();
+            $shared = $this->sharedNets($rows->pluck('ip_net')->unique()->values()->all());
+            $rows = $rows->reject(function (RiskConn $row) use ($exclude, $shared) {
+                return isset($shared[$row->ip_net]) || $exclude((string)$row->ip, (string)$row->ip_net);
+            });
+            $info = (new IpInfoService())->lookupMany($rows->pluck('ip')->unique()->values()->all());
+            $users = User::whereIn('id', $batch)->get()->keyBy('id');
+            foreach ($rows->groupBy('user_id') as $userId => $userRows) {
+                $places = $this->placeCounts($userRows, $info);
+                if (count($places) < $limit || !$users->has($userId)) continue;
+                $summary = $this->summarize($userRows, $info);
+                $names = array_filter(array_column($this->servers($summary['nodes']), 'name'));
+                $shown = [];
+                foreach (array_slice($places, 0, 3, true) as $name => $sources) $shown[] = "{$name} {$sources}";
+                $detail = self::PLACES_DAYS . ' 天内 ' . count($places) . " 个地区（{$summary['sources']} 个 IP，{$summary['brief']} 个只出现了一两分钟）："
+                    . implode('、', $shown) . (count($places) > 3 ? '…' : '') . ' · 节点 ' . (implode('、', array_slice($names, 0, 3)) ?: '-');
+                $user = $users->get($userId);
+                // Probing often enough for 连接 IP 过多 is in many places too: one alert is enough
+                $covered = $this->alertedLately('conn_ips', $user);
+                $latest = $userRows->sortByDesc('last_seen_at')->first();
+                if ($this->recordOnce($user, 'conn_places', (string)$latest->ip, $detail, self::PLACES_DAYS * 86400,
+                    $this->risk()->isQuiet($user), !$covered)) $alerted++;
+            }
+        }
+        return $alerted;
+    }
+
+    /**
+     * Record a finding about the user, alerted once in $period seconds (24 hours: not by the date, as a check before
+     * and after midnight would alert twice); later scans update the same event, without alerting. A quiet user's
+     * ($quiet) is recorded silent: it alerts once a later scan finds them no longer quiet (or, for 命中测活 IP, on a
+     * probing IP), within the same period. $send false: only recorded, as when another alert covered it. Returns
+     * whether it alerted.
+     */
+    private function recordOnce(User $user, string $type, string $ip, string $detail, int $period, bool $quiet, bool $send = true): bool
     {
         $key = "risk:conn:{$type}:" . (int)$user->id;
         $now = time();
         // Which event the later scans update: its time and a random part, as two may come within a second; ':q' after
         // them while it is silent
         $id = $now . ':' . bin2hex(random_bytes(4));
-        if (Cache::add($key, $id . ($quiet ? ':q' : ''), 86400)) {
-            if ($quiet) $this->risk()->alerts()->quieted();
-            $alert = !$quiet;
+        $silent = $send && $quiet;
+        if (Cache::add($key, $id . ($silent ? ':q' : ''), $period)) {
+            if ($silent) $this->risk()->alerts()->quieted();
+            $alert = $send && !$quiet;
         } else {
             $stored = explode(':', (string)Cache::get($key, $id));
             $id = ($stored[0] ?? $now) . ':' . ($stored[1] ?? '');
-            // Silent so far, and not quiet any more: alerted now, for the rest of the 24 hours
-            $alert = ($stored[2] ?? '') === 'q' && !$quiet;
-            if ($alert) Cache::put($key, $id, max(1, (int)$stored[0] + 86400 - $now));
+            // Silent so far, and not quiet any more: alerted now (unless another alert covers it), for the rest of the period
+            $pending = ($stored[2] ?? '') === 'q' && !$quiet;
+            $alert = $pending && $send;
+            if ($pending) Cache::put($key, $id, max(1, (int)$stored[0] + $period - $now));
         }
         $this->risk()->recordFinding($user, $type, $ip, '', $detail, "{$type}|{$user->id}|{$id}", $alert);
         return $alert;
+    }
+
+    /**
+     * Whether a connection check ($type) alerted about the user lately (within its period; not a silent finding).
+     */
+    private function alertedLately(string $type, User $user): bool
+    {
+        $stored = Cache::get("risk:conn:{$type}:" . (int)$user->id);
+        return $stored !== null && substr((string)$stored, -2) !== ':q';
     }
 
     /**
@@ -625,6 +689,41 @@ class RiskConnService
     private static function nearKeySql(string $column): string
     {
         return "HEX(SUBSTRING(INET6_ATON(SUBSTRING_INDEX({$column}, '/', 1)), 1, IF(LOCATE(':', {$column}) > 0, 6, 3)))";
+    }
+
+    /**
+     * How many of the rows' sources are in each place (place(): a province, Hong Kong, Macao and Taiwan each as one, or
+     * a country overseas; unknown ones not counted), the most first: [name => sources]. $info: IpInfoService::lookupMany()
+     * of their IPs.
+     */
+    public function placeCounts($rows, array $info): array
+    {
+        $places = [];
+        foreach ($rows as $row) {
+            if ((string)$row->ip_net === '') continue;
+            [$kind, $name] = $this->place($info[$row->ip]['location'] ?? null);
+            if ($kind !== 'unknown') $places[$name][(string)$row->ip_net] = true;
+        }
+        $counts = array_map('count', $places);
+        arsort($counts);
+        return $counts;
+    }
+
+    /**
+     * The places of the user's sources in the last PLACES_DAYS days, counted as 连接地区过多 counts them (left-out
+     * and shared sources aside), for the bot's user card.
+     */
+    public function places(User $user): int
+    {
+        $rows = RiskConn::where('record_at', '>=', $this->access()->day(time()) - (self::PLACES_DAYS - 1) * 86400)
+            ->where('user_id', $user->id)->where('ip_net', '!=', '')->get();
+        if (!$rows->count()) return 0;
+        $exclude = $this->risk()->links()->excluder();
+        $shared = $this->sharedNets($rows->pluck('ip_net')->unique()->values()->all());
+        $rows = $rows->reject(function (RiskConn $row) use ($exclude, $shared) {
+            return isset($shared[$row->ip_net]) || $exclude((string)$row->ip, (string)$row->ip_net);
+        });
+        return count($this->placeCounts($rows, (new IpInfoService())->lookupMany($rows->pluck('ip')->unique()->values()->all())));
     }
 
     /**

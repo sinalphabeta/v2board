@@ -51,7 +51,7 @@ class RiskView
         'link_detection' => '关联检测', 'link_ip_users' => '同 IP 多用户阈值', 'daily_report' => '每晚日报',
         'alert_daily_limit' => '每类告警每天上限', 'sub_burst_limit' => '10 分钟订阅次数告警',
         'conn_log_enabled' => '连接记录', 'conn_log_days' => '连接记录保留天数', 'conn_ip_limit' => '1 小时连接 IP 数告警',
-        'conn_link_ips' => '命中测活 IP 告警', 'conn_link_loose' => '测活 IP 按网段匹配',
+        'conn_link_ips' => '命中测活 IP 告警', 'conn_link_loose' => '测活 IP 按网段匹配', 'conn_place_limit' => '7 天连接地区数告警',
     ];
     // How an access log row's result shows, when it is not ok
     private const ACCESS_RESULTS = ['failed' => '密码错误', 'isolated' => '蜜罐', 'unavailable' => '不可用', 'limited' => '超限'];
@@ -68,7 +68,7 @@ class RiskView
         'quiet' => self::QUIET_ABOUT,
     ];
     // What 免告警 does, for the list and the confirmation
-    private const QUIET_ABOUT = '照样记录；连接 IP 过多、订阅过频、订阅超限只记风险事件、不发 Bot，命中测活 IP 只发同一个 IP 的。适合把套餐分享给朋友的用户';
+    private const QUIET_ABOUT = '照样记录；连接 IP 过多、连接地区过多、订阅过频、订阅超限只记风险事件、不发 Bot，命中测活 IP 只发同一个 IP 的。适合把套餐分享给朋友的用户';
     // How many of the node IPs found by the node APIs the node IP list shows
     private const AUTO_NODES_SHOWN = 10;
     // Tells a node's exit IP (RiskAccessService::nodeMatcher()), made once per view
@@ -298,8 +298,14 @@ class RiskView
             $lines[] = '重置后旧链接: ' . $this->escape('近 ' . RiskAccessService::OLD_LINK_DAYS . " 天 {$old[0]} 次 · {$old[1]} 个 IP · 最后 " .
                 $this->time($old[2]));
         }
-        $connected = (new RiskConnService())->today($user);
-        if ($connected) $lines[] = '连接节点: ' . $this->escape("今天 {$connected[0]} 个 IP（{$connected[1]} 个网段）");
+        $conn = new RiskConnService();
+        $connected = $conn->today($user);
+        $places = $conn->places($user);
+        $parts = array_filter([
+            $connected ? "今天 {$connected[0]} 个 IP（{$connected[1]} 个网段）" : null,
+            $places ? RiskConnService::PLACES_DAYS . " 天 {$places} 个地区" : null,
+        ]);
+        if ($parts) $lines[] = '连接节点: ' . $this->escape(implode(' · ', $parts));
         $lines = array_merge($lines, [
             '',
             '*最近订阅*',
@@ -421,7 +427,7 @@ class RiskView
             if (in_array($event->event_type, ['ip_users', 'register_link', 'conn_link'], true) && filter_var($event->ip, FILTER_VALIDATE_IP)) {
                 $finding[] = $this->button('🔎 这个 IP 的用户', 'r:n:' . str_replace(':', '-', (string)$event->ip));
             }
-            if (in_array($event->event_type, ['conn_ips', 'conn_link'], true)) $finding[] = $this->button('📡 连接记录', "r:cnr:{$user->id}");
+            if (in_array($event->event_type, ['conn_ips', 'conn_link', 'conn_places'], true)) $finding[] = $this->button('📡 连接记录', "r:cnr:{$user->id}");
             // The isolated user whose probing IP it was
             if ($event->event_type === 'conn_link' && preg_match('/已隔离用户 uid (\d+)/u', (string)$event->detail, $owner)) {
                 $finding[] = $this->button('👤 被隔离的 uid ' . $owner[1], "r:cr:{$owner[1]}");
@@ -429,7 +435,7 @@ class RiskView
             if ($event->event_type === 'sub_limit' && $this->limitedToday($user)) {
                 $finding[] = $this->button('✅ 今天放行', "r:t:a:{$user->id}:{$eventId}");
             }
-            if (in_array($event->event_type, ['sub_limit', 'ip_users', 'sub_burst', 'conn_ips'], true)) {
+            if (in_array($event->event_type, ['sub_limit', 'ip_users', 'sub_burst', 'conn_ips', 'conn_places'], true)) {
                 $finding[] = $this->button('♻️ 重置订阅', "r:s:a:{$user->id}:{$eventId}");
             }
             if (in_array($event->event_type, RiskService::QUIET_TYPES, true)) $finding[] = $this->quietButton($user, 'a', (string)$eventId);

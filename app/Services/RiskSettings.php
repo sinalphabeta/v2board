@@ -45,6 +45,8 @@ class RiskSettings
         'conn_link_ips' => 1,
         // 测活 IP 按网段匹配: a source in the same IPv4 /24 or IPv6 /48 as a probing IP counts too
         'conn_link_loose' => false,
+        // 连接地区过多: the places (provinces, countries overseas) of a user's sources in 7 days that alert; 0: not checked
+        'conn_place_limit' => 6,
     ];
     private const CACHE_KEY = 'risk:settings';
     private const CACHE_SECONDS = 60;

@@ -181,7 +181,7 @@ class RiskLinkService
             'bursts' => RiskEvent::where('event_type', 'sub_burst')->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'link_alerts' => RiskEvent::whereIn('event_type', ['ip_users', 'register_link'])
                 ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
-            'conn_alerts' => RiskEvent::whereIn('event_type', ['conn_ips', 'conn_link'])
+            'conn_alerts' => RiskEvent::whereIn('event_type', ['conn_ips', 'conn_link', 'conn_places'])
                 ->where('first_seen_at', '>=', $from)->where('first_seen_at', '<', $to)->count(),
             'skipped_alerts' => $this->risk->skippedAlerts($from),
             'merged_alerts' => $this->risk->alerts()->dayCounts($from)['merged'],
